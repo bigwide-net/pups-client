@@ -52,6 +52,6 @@
     "vitest": "^3.2.7"
   },
   "bin": {
-    "pups": "./dist/cli/bin.js"
+    "pups": "dist/cli/bin.js"
   }
 }
