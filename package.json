@@ -3,6 +3,14 @@
   "version": "0.1.0",
   "description": "Browser client and command line tool for Personal Upload Servers (PUPS, bigwide.net RFC-6): sign in with your domain and write files to it.",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/bigwide-net/pups-client.git"
+  },
+  "homepage": "https://github.com/bigwide-net/pups-client#readme",
+  "bugs": {
+    "url": "https://github.com/bigwide-net/pups-client/issues"
+  },
   "type": "module",
   "sideEffects": false,
   "exports": {

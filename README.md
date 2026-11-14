@@ -1,6 +1,6 @@
 # pups-client
 
-The reference client for **Personal Upload Servers** (PUPS, [bigwide.net RFC-6](../RFCs/RFC-6-Personal-Upload-Server.md)): sign a user in with their own domain, and write files to it.
+The reference client for **Personal Upload Servers** (PUPS, [bigwide.net RFC-6](https://github.com/bigwide-net/RFCs/blob/main/RFC-6-Personal-Upload-Server.md)): sign a user in with their own domain, and write files to it.
 
 - **Browser library** in TypeScript, without runtime dependencies.
 - **Command line tool** `pups`, for uploading from a terminal or a script.
