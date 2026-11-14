@@ -9,6 +9,7 @@ export interface MockOptions {
   domain?: string
   postFallback?: boolean
   hostMetaEndpoint?: boolean
+  /** Lifetime of the access token from the code exchange. Refreshed access tokens live 3600 seconds. */
   expiresIn?: number
   graceMs?: number
 }
@@ -76,10 +77,10 @@ export function createMockServer(options: MockOptions = {}) {
   const apiError = (status: number, error: string) => json(status, { error, message: error })
 
   const issue = (_grant?: Grant): Pair => ({ refresh: token('rt'), access: token('at'), used: false })
-  const tokenBody = (grant: Grant) => ({
+  const tokenBody = (grant: Grant, expiresIn = 3600) => ({
     access_token: grant.current.access,
     token_type: 'Bearer',
-    expires_in: options.expiresIn ?? 3600,
+    expires_in: expiresIn,
     refresh_token: grant.current.refresh,
     scope: grant.scopes.join(' '),
     me: state.me,
@@ -107,7 +108,7 @@ export function createMockServer(options: MockOptions = {}) {
       const grant: Grant = { clientId: code.clientId, scopes: code.scopes, revoked: false, current: undefined! }
       grant.current = issue(grant)
       grants.push(grant)
-      return json(200, tokenBody(grant))
+      return json(200, tokenBody(grant, options.expiresIn))
     }
     if (body.get('grant_type') == 'refresh_token') {
       if (state.failRefreshes > 0) {
