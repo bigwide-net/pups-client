@@ -1,0 +1,48 @@
+{
+  "name": "pups-client",
+  "version": "0.1.0",
+  "description": "Browser client and command line tool for Personal Upload Servers (PUPS, bigwide.net RFC-6): sign in with your domain and write files to it.",
+  "license": "MIT",
+  "type": "module",
+  "sideEffects": false,
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "pups",
+    "personal-upload-server",
+    "oauth",
+    "pkce",
+    "indieweb",
+    "socialspec",
+    "bigwide"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "prepublishOnly": "npm run typecheck && npm test && npm run build"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "devDependencies": {
+    "@types/node": "^24.19.2",
+    "fake-indexeddb": "^6.2.8",
+    "typescript": "^5.9.3",
+    "vitest": "^3.2.7"
+  },
+  "bin": {
+    "pups": "./dist/cli/bin.js"
+  }
+}
