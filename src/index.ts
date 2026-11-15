@@ -16,6 +16,25 @@ export type {
 } from './client.js'
 export { PupsSession } from './session.js'
 export type { Body, JsonBody, SessionChangeEvent, StoredFile, WriteOptions, WriteResult } from './session.js'
+export { FEED_REL, PUPS_FEED_SPEC, PupsFeed, feedScopes } from './feed.js'
+export type {
+  FeedAttachment,
+  FeedAuthor,
+  FeedDocument,
+  FeedItem,
+  FeedLink,
+  FeedOptions,
+  FeedSettings,
+  FeedSettingsChanges,
+  FeedSetup,
+  FeedState,
+  MediaInput,
+  MediaResult,
+  PostChanges,
+  PostInput,
+  PostResult,
+  PupsMarker,
+} from './feed.js'
 export { HostMetaEditor } from './host-meta.js'
 export type { HostMetaDocument, HostMetaLink } from './host-meta.js'
 export { PupsError, isPupsError } from './errors.js'

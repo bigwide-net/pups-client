@@ -53,10 +53,10 @@ describe('authorization', () => {
   })
 
   it('handles a narrowed grant', async () => {
-    const { session } = await connect({ scopes: ['appdata', 'write:/feeds/bigwide/'], grant: ['write:/appdata/app.example/'] })
+    const { session } = await connect({ scopes: ['appdata', 'write:/feed/'], grant: ['write:/appdata/app.example/'] })
     expect(session.canWrite('x.json')).toBe(true)
-    expect(session.canWrite('/feeds/bigwide/feed.xml')).toBe(false)
-    expect(session.hasScope('write:/feeds/bigwide/')).toBe(false)
+    expect(session.canWrite('/feed/photos.json')).toBe(false)
+    expect(session.hasScope('write:/feed/')).toBe(false)
   })
 
   it('checks the issuer before redeeming the code', async () => {
@@ -125,7 +125,7 @@ describe('files', () => {
   it('rejects what the server would reject, before sending', async () => {
     const { session, mock } = await connect()
     const before = mock.state.requests.length
-    expect(await errorCode(session.put('/feeds/bigwide/feed.xml', '<rss/>'))).toBe('insufficient_scope')
+    expect(await errorCode(session.put('/feed/photos.json', '{}'))).toBe('insufficient_scope')
     expect(await errorCode(session.put('../escape.json', '{}'))).toBe('invalid_path')
     expect(await errorCode(session.put('page.html', '<p>'))).toBe('unsupported_type')
     expect(await errorCode(session.put('feed.php.json', '{}'))).toBe('unsupported_type')
@@ -167,10 +167,10 @@ describe('files', () => {
 
 describe('host-meta.json', () => {
   it('adds links to own files with allowed rels only', async () => {
-    const { session, mock } = await connect({ scopes: ['appdata', 'write:/feeds/bigwide/'] })
-    await session.put('/feeds/bigwide/feed.xml', '<rss/>')
-    await session.hostMeta.addLink({ rel: 'https://bigwide.net/ns/feed', href: '/feeds/bigwide/feed.xml', type: 'application/rss+xml' })
-    expect(mock.state.hostMeta.links.at(-1)).toMatchObject({ href: 'https://tim.example.com/files/feeds/bigwide/feed.xml' })
+    const { session, mock } = await connect({ scopes: ['appdata', 'write:/feed/'] })
+    await session.put('/feed/photos.json', '{}')
+    await session.hostMeta.addLink({ rel: 'https://bigwide.net/ns/feed', href: '/feed/photos.json', type: 'application/feed+json' })
+    expect(mock.state.hostMeta.links.at(-1)).toMatchObject({ href: 'https://tim.example.com/feed/photos.json' })
     await session.hostMeta.addLink({ rel: 'https://app.example/rel/index', href: 'index.json' })
 
     expect(session.hostMeta.allowsRel('https://other.example/rel', 'index.json')).toBe(false)

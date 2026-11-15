@@ -36,7 +36,7 @@ describe('normalizeDomain', () => {
 describe('validatePath', () => {
   it.each([
     '/appdata/app.example/comments.json',
-    '/feeds/bigwide/2026/feed.xml',
+    '/feed/images/2026/photo.jpg',
     '/.well-known/about.md',
     '/appdata/app.example/ünïcode name.md',
   ])('accepts %s', path => expect(code(() => validatePath(path, server.wellKnownPaths))).toBe('ok'))
@@ -80,8 +80,8 @@ describe('scopes', () => {
 
   it.each([
     [['identify', 'write:/appdata/app.example/'], 'ok'],
-    [['write:/feeds/bigwide/'], 'ok'],
-    [['write:/feeds/bigwide/2026/'], 'ok'],
+    [['write:/feed/photos/'], 'ok'],
+    [['write:/feed/photos/2026/'], 'ok'],
     [['write:/.well-known/about.md'], 'ok'],
     [['write:/appdata/other.example/'], 'invalid_scope'],
     [['write:/appdata/'], 'invalid_scope'],

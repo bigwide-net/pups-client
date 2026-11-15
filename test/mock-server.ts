@@ -12,6 +12,7 @@ export interface MockOptions {
   /** Lifetime of the access token from the code exchange. Refreshed access tokens live 3600 seconds. */
   expiresIn?: number
   graceMs?: number
+  maxUploadBytes?: number
 }
 
 interface Pair { refresh: string; access: string; used: boolean }
@@ -40,12 +41,13 @@ export function createMockServer(options: MockOptions = {}) {
     public_base: `${origin}/files/`,
     scopes_supported: ['identify', 'write:/appdata/'],
     well_known_paths: [
-      { path: '/feeds/bigwide/', rels: ['https://bigwide.net/ns/feed'] },
+      { path: '/feed.json', url: `${origin}/feed.json`, rels: ['https://bigwide.net/ns/feed'] },
+      { path: '/feed/', url: `${origin}/feed/`, rels: ['https://bigwide.net/ns/feed'] },
       { path: '/.well-known/about.md', url: `${origin}/.well-known/about.md`, properties: ['https://bigwide.net/ns/name'] },
     ],
     ...options.hostMetaEndpoint ?? true ? { host_meta_endpoint: `${origin}/pups/host-meta` } : {},
     ...options.postFallback ? { post_endpoint: `${origin}/pups/post` } : {},
-    max_upload_bytes: 1000,
+    max_upload_bytes: options.maxUploadBytes ?? 1000,
     spec_version: '0.1',
   }
 

@@ -34,7 +34,7 @@ pups login tjansen.de --client tim.example.app
 
 pups whoami
 pups put photo.jpg notes.md                    # → /appdata/tim.example.app/photo.jpg, …
-pups put feed.json --to feeds/                 # → /appdata/tim.example.app/feeds/feed.json
+pups put data.json --to backup/                # → /appdata/tim.example.app/backup/data.json
 echo '# Hi' | pups put - --to hello.md         # from stdin
 pups get hello.md
 pups rm hello.md
@@ -44,9 +44,9 @@ pups logout                                    # forgets the credentials and rev
 Paths without a leading `/` are in the app's own directory, `/appdata/<client-domain>/`. To write elsewhere, ask for a well-known path the server declares:
 
 ```sh
-pups login tjansen.de -c tim.example.app -s appdata -s write:/.well-known/about.md
+pups login tjansen.de -c tim.example.app -s appdata -s write:/.well-known/about.md -s write:/feed/photos.json
 pups put about.md --to /.well-known/about.md --if-match '"etag-you-read"'
-pups link add https://bigwide.net/ns/feed /feeds/bigwide/feed.xml --type application/rss+xml
+pups link add https://bigwide.net/ns/feed /feed/photos.json --type application/feed+json
 ```
 
 Run `pups --help` for every command and option. Options can also come from `PUPS_CLIENT` and `PUPS_DOMAIN`.
@@ -98,6 +98,38 @@ Your app publishes its client metadata document on its own domain:
 ```
 
 During development, `await pups.checkClientMetadata()` reports everything a PUPS server would reject.
+
+### Feeds
+
+`session.feed()` maintains a blog feed, or any similar stream of posts, on the owner's domain, following [RFC-7](https://github.com/bigwide-net/RFCs/blob/main/RFC-7-Feed-Publishing-with-PUPS.md): the main feed `/feed.json`, or a named feed `/feed/<name>.json`, each a JSON Feed 1.1 with its archives, icons and media in a feed directory, `/feed/` or `/feed/<name>/`. Icons go into `/feed/images/icons/` (`/feed/<name>/images/icons/`), the main feed's media into `/feed/images/` and `/feed/media/`.
+
+```ts
+import { feedScopes } from 'pups-client'
+
+const session = await pups.loginWithPopup(domain, { scopes: ['identify', ...feedScopes()] })   // or feedScopes('photos')
+const feed = session.feed()                                       // or session.feed('photos')
+
+const state = await feed.load()                                   // 'missing' | 'pups' | 'foreign' | 'invalid'
+if (state.status == 'missing')
+  await feed.create({ title: "Tim's Notes", description: 'Short notes', icon: iconFile })   // also registers it in host-meta.json
+else if (state.status == 'foreign')
+  showMessage('Your feed is maintained by other means.')          // never written without "_pups": { "pupsControlled": true }
+
+const photo = await feed.uploadMedia(photoFile)                   // → https://…/feed/images/2026/….jpg
+const post = await feed.addPost({ title: 'Hello', content_html: `<p>Hi!</p><img src="${photo.url}" alt="">` })
+await feed.addPost({ markdown: 'Written in *Markdown*' })         // _source.markdown, with content_text as fallback
+await feed.editPost(post.id, { title: 'Hello, world' })           // wherever the post is now, sets date_modified
+await feed.deletePost(post.id, { deleteMedia: true })             // also deletes media no other post uses
+await feed.updateSettings({ description: 'Longer notes', _podcast: { explicit: false } })
+
+for await (const item of feed.posts()) console.log(item.id)       // newest first, through all archives
+const feeds = await session.listFeeds()                           // the feeds registered in host-meta.json
+```
+
+- **Archives.** Every post goes into the newest archive, `feed.000000.json`, `feed.000001.json`, … in the feed directory, 20 posts each, linked with `next_url`; posts never move. The feed file holds a copy of the newest 30 posts and points to the newest archive with `_pups.archive_url`; archives point back with `_pups.updates_url`. `session.feed(name, { maxItems, archiveSize, maxBytes })` changes the sizes.
+- **Concurrency.** Every change is a read-modify-write with ETags, repeated when another app or the owner wrote in between. The archive is always written before the feed file, so no post is ever lost, and the next post repairs a feed file that an interrupted post didn't reach.
+- **Post URLs.** `addPost()` returns `url`, the post's archive URL plus `#<id>`. It never changes, so it can be the `source` of an RFC-4 webmention.
+- Errors: `not_pups_controlled` for feeds without the marker, `invalid_feed` for files that aren't JSON Feeds, `not_found` for a missing feed or post.
 
 ### What the library does for you
 

@@ -1,5 +1,6 @@
 import { discover, type PupsServer } from './discovery.js'
 import { errorFromResponse, isPupsError, PupsError } from './errors.js'
+import { listFeeds, PupsFeed, type FeedLink, type FeedOptions } from './feed.js'
 import { fileTypeOf, uploadContentType } from './file-types.js'
 import { HostMetaEditor } from './host-meta.js'
 import { revokeToken } from './oauth.js'
@@ -256,6 +257,20 @@ export class PupsSession {
   async delete(path: string, options: { ifMatch?: string; signal?: AbortSignal } = {}): Promise<void> {
     const absolute = this.#checkWritable(path)
     await this.#write('DELETE', absolute, options.ifMatch ? { 'If-Match': quoteEtag(options.ifMatch) } : {}, undefined, options.signal)
+  }
+
+  /**
+   * A feed on the owner's domain, maintained according to RFC-7: the main feed `/feed.json` without a name, or the
+   * named feed `/feed/<name>.json`. The session needs the feed's scopes, see `feedScopes()`.
+   * @throws {PupsError} `invalid_request` for an invalid name.
+   */
+  feed(name?: string, options: FeedOptions = {}): PupsFeed {
+    return new PupsFeed(this, name, options)
+  }
+
+  /** The feeds registered in the owner's `host-meta.json`, e.g. to let the owner choose one to post to. */
+  listFeeds(options: { signal?: AbortSignal } & FeedOptions = {}): Promise<FeedLink[]> {
+    return listFeeds(this, options)
   }
 
   /**

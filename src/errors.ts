@@ -43,6 +43,11 @@ export type PupsErrorCode =
   | 'too_large'
   | 'unsupported_type'
   | 'insufficient_storage'
+  // Feeds (RFC-7)
+  /** A feed file or archive has no `_pups.pupsControlled` marker: it is maintained by other means and never written. */
+  | 'not_pups_controlled'
+  /** A feed file or archive is not a JSON Feed. */
+  | 'invalid_feed'
   /** `409` from the host-meta endpoint: a single-valued rel is taken, or `host-meta.json` is not valid JSON. */
   | 'conflict'
   /** `429`: the server limits the write rate of this grant. See {@link PupsError.retryAfter}. */

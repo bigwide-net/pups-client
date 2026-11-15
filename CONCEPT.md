@@ -345,11 +345,47 @@ interface HostMetaEditor {
 }
 ```
 
-- `href` may be a path (`feeds/bigwide/feed.xml`, `/feeds/bigwide/feed.xml`) or a full public URL. Paths are turned into public URLs with `publicUrl()`. Either way, the library checks that the file lies inside a granted scope.
+- `href` may be a path (`index.json` in the app's own directory, `/feed/photos.json`) or a full public URL. Paths are turned into public URLs with `publicUrl()`. Either way, the library checks that the file lies inside a granted scope.
 - `allowsRel()` and `allowedProperties()` follow the RFC: for a file under a well-known path, the `rels` and `properties` declared for that path in `wellKnownPaths`, if its scope is granted; for a file in the app's own directory, URI rels on the client host (with or without `www.`). Calls outside them fail with `insufficient_scope` before any request.
 - Some rules are known only to the server: which rels are **single-valued** and which properties take a **URL** as their value come from the bigwide.net list of well-known paths and are not in the configuration document. The library therefore can't check them in advance. A taken single-valued rel ends with `conflict`; a URL value outside the granted scope ends with `insufficient_scope` or `invalid_request`, as the server answers.
 - `setProperty` checks what it can: a non-empty string of at most 2,048 characters without control characters.
 - If `available` is false, every write method throws `unsupported`.
+
+### `PupsFeed`
+
+`session.feed(name?, options?)` returns a `PupsFeed` for the main feed `/feed.json` or the named feed `/feed/<name>.json`, maintained according to [RFC-7](https://github.com/bigwide-net/RFCs/blob/main/RFC-7-Feed-Publishing-with-PUPS.md). `feedScopes(name?)` lists the two scopes it needs: the feed file and the feed directory.
+
+```ts
+interface PupsFeed {
+  readonly name?: string           // undefined for the main feed
+  readonly path: string            // '/feed.json', '/feed/photos.json'
+  readonly directory: string       // '/feed/', '/feed/photos/'
+  readonly url: string             // feed_url
+  readonly writable: boolean
+
+  load(): Promise<FeedState>       // missing | pups (with feed and etag) | foreign | invalid
+  create(setup: FeedSetup, options?: { register?: boolean }): Promise<{ url: string; registered: boolean }>
+  register(): Promise<boolean>     // host-meta.json link with https://bigwide.net/ns/feed
+  updateSettings(changes: FeedSettingsChanges): Promise<FeedDocument>
+  setIcon(media: MediaInput | null): Promise<FeedDocument>
+  setFavicon(media: MediaInput | null): Promise<FeedDocument>
+  uploadMedia(media: MediaInput, options?: { folder?: string }): Promise<MediaResult>
+
+  addPost(post: PostInput): Promise<PostResult>   // url: the post's archive URL + '#id'
+  getPost(id: string): Promise<PostResult | undefined>
+  posts(): AsyncGenerator<FeedItem>
+  editPost(id: string, changes: PostChanges | ((item: FeedItem) => FeedItem | undefined)): Promise<PostResult>
+  deletePost(id: string, options?: { deleteMedia?: boolean }): Promise<{ item: FeedItem; deletedMedia: string[] }>
+}
+```
+
+- **The marker.** Every feed file and archive the library creates carries `"_pups": { "pupsControlled": true }`. Files without it are never written; writes fail with `not_pups_controlled`. On every write of the feed file, the library sets the fixed fields (`version`, `home_page_url`, `feed_url`, `user_comment`), so a feed the owner handed over gets them on its first write.
+- **Settings.** `create()` and `updateSettings()` accept only the owner's fields (`title`, `description`, `authors`, `language`, `expired`) and extensions starting with `_` (except `_pups`). Icons go through `setIcon()` and `setFavicon()`, which upload a new file to `/feed/images/icons/` (`/feed/<name>/images/icons/` for a named feed) and delete the old one.
+- **Layout.** Named feeds share `/feed/` with the main feed, so the main feed's media go only into `/feed/images/` and `/feed/media/`, the names `images` and `media` can't be feed names, and `deletePost(…, { deleteMedia: true })` on the main feed never touches files of named feeds.
+- **Posting.** `addPost()` adds the post to the newest archive (the one `_pups.archive_url` names), or creates a new archive linked to it once the newest holds `archiveSize` (20) posts, and then inserts it at the top of the feed file, which keeps the newest `maxItems` (30), fewer with `maxBytes`. The archive is written first; the feed file always takes all posts of the newest archive, which repairs interrupted posts. Every step is repeated on `412`, up to `maxAttempts` (8). A handed-over feed without `archive_url` gets its existing items archived first, oldest first, with its old `next_url` at the end of the chain.
+- **Post URLs.** `PostResult.url` is the post's archive URL plus `#<id>`. Posts never leave their archive, so it never changes; an RFC-4 webmention uses it as `source`.
+- **Editing and deleting** find the post in the archives, from `_pups.archive_url` along `next_url`, change its archive, and then the feed file if the post is there. After a delete, the feed file is filled up again from the archives. `deletePost(id, { deleteMedia: true })` reads all archives to find media no other post references.
+- **Ids** are 16 random URL-safe characters unless given; `date_published` defaults to now; `markdown` goes into `_source.markdown` (RFC-1), with `content_text` as the fallback JSON Feed requires.
 
 ### Errors
 
@@ -375,6 +411,8 @@ type PupsErrorCode =
   // uploads, as in the RFC's error table
   | 'invalid_path' | 'invalid_token' | 'insufficient_scope' | 'not_found' | 'precondition_failed'
   | 'too_large' | 'unsupported_type' | 'insufficient_storage' | 'conflict' | 'rate_limited' | 'invalid_request'
+  // feeds (RFC-7)
+  | 'not_pups_controlled' | 'invalid_feed'
   // other
   | 'unsupported' | 'network' | 'aborted' | 'server_error'
 ```
@@ -606,13 +644,20 @@ if (!session.canWrite('/.well-known/about.md')) return showMessage('Profile acce
 await session.update('/.well-known/about.md', () => markdown)
 ```
 
-### A feed with a `host-meta.json` link
+### A blog feed (RFC-7)
 
 ```ts
-const session = await pups.loginWithPopup(domain, { scopes: ['write:/feeds/bigwide/'] })
-await session.update('/feeds/bigwide/feed.xml', file => buildRss(file))
-if (session.hostMeta.available)
-  await session.hostMeta.addLink({ rel: 'https://bigwide.net/ns/feed', href: '/feeds/bigwide/feed.xml', type: 'application/rss+xml' })
+const session = await pups.loginWithPopup(domain, { scopes: feedScopes() })
+const feed = session.feed()
+if ((await feed.load()).status == 'missing') await feed.create({ title: "Tim's Notes" })   // registers it in host-meta.json
+await feed.addPost({ title: 'Hello', content_html: '<p>Hi!</p>' })
+```
+
+### An RFC-4 comment in the main feed
+
+```ts
+const { url } = await session.feed().addPost({ content_text: text, _source: { inReplyTo: target } })
+await sendWebmention({ source: url, target })   // the archive URL + '#id', which never changes
 ```
 
 ## Requirements for apps
