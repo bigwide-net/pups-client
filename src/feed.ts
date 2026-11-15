@@ -18,7 +18,7 @@ const maxArchiveNumber = 999_999
 /** The feed file keeps at least this many items, also when `maxBytes` is exceeded (RFC-7 "Size in bytes"). */
 const minFeedItems = 10
 
-const mainComment = `This feed is maintained by apps through a Personal Upload Server (PUPS), following ${PUPS_FEED_SPEC}. It contains the newest items. All items are in the archives, starting with the one at _pups.archive_url.`
+const mainComment = `This feed is maintained by apps through a Personal Upload Server (PUPS), following ${PUPS_FEED_SPEC}. It contains the newest items. If it has _pups.archive_url, all items are in the archives, starting with the one there.`
 const archiveComment = (feedUrl: string) =>
   `This is an archive of ${feedUrl}, maintained by apps through a Personal Upload Server (PUPS), following ${PUPS_FEED_SPEC}. New items appear in the feed at _pups.updates_url, older ones are in the archive at next_url.`
 
@@ -164,7 +164,7 @@ export interface PostResult {
   item: FeedItem
   /**
    * The URL of the item's archive plus `#<id>`. Items never leave their archive, so it never changes; use it e.g.
-   * as the `source` of an RFC-4 webmention.
+   * as the `source` of an RFC-4 webmention. In a feed without archives, the feed file's URL plus `#<id>`.
    */
   url: string
 }
@@ -193,6 +193,12 @@ export interface FeedOptions {
   maxItems?: number
   /** How many items an archive holds. Default 20 (RFC-7 "Archives"); other clients expect 20. */
   archiveSize?: number
+  /**
+   * Whether to start archives for a feed that has none, on its next post (RFC-7 "Starting the archives").
+   * Default true. With false, posts to such a feed only go into the feed file, and items beyond `maxItems` are
+   * dropped. Feeds that have archives always keep them.
+   */
+  startArchives?: boolean
   /**
    * Optional: keep fewer items in the feed file when it would be larger than this many bytes, but at least 10
    * (RFC-7 "Size in bytes").
@@ -305,6 +311,7 @@ export class PupsFeed {
   readonly #session: PupsSession
   readonly #maxItems: number
   readonly #archiveSize: number
+  readonly #archivesWanted: boolean
   readonly #maxBytes?: number
   readonly #maxAttempts: number
 
@@ -317,6 +324,7 @@ export class PupsFeed {
     this.#session = session
     this.#maxItems = options.maxItems ?? 30
     this.#archiveSize = options.archiveSize ?? 20
+    this.#archivesWanted = options.startArchives ?? true
     this.#maxBytes = options.maxBytes
     this.#maxAttempts = options.maxAttempts ?? 8
     if (!(this.#archiveSize >= 1 && this.#maxItems >= 1))
@@ -460,10 +468,12 @@ export class PupsFeed {
   }
 
   /**
-   * Adds a post (RFC-7 "Posting"): first to the newest archive, or to a new archive once the newest holds
-   * `archiveSize` items, then to the top of the feed file, which keeps the newest `maxItems`. Upload media with
-   * `uploadMedia()` before posting.
-   * @returns the post, with `url`, its archive's URL plus `#<id>`, which never changes.
+   * Adds a post (RFC-7 "Posting with archives"): first to the newest archive, or to a new archive once the newest
+   * holds `archiveSize` items, then to the top of the feed file, which keeps the newest `maxItems`. A feed without
+   * archives gets them now, unless `startArchives` is false; then the post only goes into the feed file. Upload
+   * media with `uploadMedia()` before posting.
+   * @returns the post, with `url`: its archive's URL plus `#<id>`, which never changes; for a feed without
+   *   archives, the feed file's URL plus `#<id>`, valid while the post is among the newest.
    */
   async addPost(input: PostInput, options: Signal = {}): Promise<PostResult> {
     const item = this.#newItem(input)
@@ -478,6 +488,12 @@ export class PupsFeed {
       firstAttempt = false
       const doc: FeedDocument = { ...main.doc, _pups: { ...main.doc._pups } }
       const hasArchives = this.#archiveNumber(doc._pups!.archive_url) !== undefined
+      if (!hasArchives && !this.#archivesWanted) {
+        // A feed without archives: the feed file is all there is (RFC-7 "Posting").
+        archiveUrl = this.url
+        await this.#writeMain({ ...doc, items: this.#newestItems([item], doc.items, doc) }, main.etag, signal)
+        return
+      }
       if (!hasArchives) {
         const started = await this.#startArchives(main, signal)
         if (started) doc._pups!.archive_url = started

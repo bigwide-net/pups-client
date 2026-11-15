@@ -244,6 +244,30 @@ describe('posting and archiving', () => {
     expect(ids(main)).toEqual(['new', ...range(25, 1).map(id => `old-${id}`)])
   })
 
+  it('keeps a feed without archives when startArchives is false', async () => {
+    const { mock, session } = await connect()
+    const simple = session.feed(undefined, { startArchives: false, maxItems: 5 })
+    await simple.create({ title: 'Simple' })
+    const first = await simple.addPost({ id: 'p1', content_text: '1' })
+    expect(first.url).toBe(`${origin}/feed.json#p1`)
+    await postMany(simple, 2, 7)
+    expect(ids(read(mock, '/feed.json'))).toEqual(range(7, 3))
+    expect(read(mock, '/feed.json')._pups).not.toHaveProperty('archive_url')
+    expect(mock.state.files.has('/feed/feed.000000.json')).toBe(false)
+    await simple.editPost('p5', { title: 'Five' })
+    expect(read(mock, '/feed.json').items[2]).toMatchObject({ id: 'p5', title: 'Five' })
+    await simple.deletePost('p7')
+    expect(ids(read(mock, '/feed.json'))).toEqual(range(6, 3))
+
+    // A client that starts archives takes the feed over with the items it still has.
+    const archiving = session.feed(undefined, { maxItems: 5 })
+    expect((await archiving.addPost({ id: 'p8', content_text: '8' })).url).toBe(`${origin}/feed/feed.000000.json#p8`)
+    expect(ids(read(mock, '/feed/feed.000000.json'))).toEqual(['p8', ...range(6, 3)])
+    // From then on, the feed keeps its archives, also for clients that wouldn't start them.
+    await simple.addPost({ id: 'p9', content_text: '9' })
+    expect(ids(read(mock, '/feed/feed.000000.json'))).toEqual(['p9', 'p8', ...range(6, 3)])
+  })
+
   it('keeps an optional next_url of the feed file pointing to the newest archive', async () => {
     const { mock, session } = await connect()
     const feed = session.feed(undefined, { archiveSize: 2 })
