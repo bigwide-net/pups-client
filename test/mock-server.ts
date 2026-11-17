@@ -44,6 +44,8 @@ export function createMockServer(options: MockOptions = {}) {
       { path: '/feed.json', url: `${origin}/feed.json`, rels: ['https://bigwide.net/ns/feed'] },
       { path: '/feed/', url: `${origin}/feed/`, rels: ['https://bigwide.net/ns/feed'] },
       { path: '/.well-known/about.md', url: `${origin}/.well-known/about.md`, properties: ['https://bigwide.net/ns/name'] },
+      { path: '/pups/pages/', url: `${origin}/pups/pages/`, rels: ['https://bigwide.net/ns/webpup-pages'],
+        properties: ['https://bigwide.net/ns/webpup-footer'], link_properties: ['https://bigwide.net/ns/webpup-hidden'] },
     ],
     ...options.hostMetaEndpoint ?? true ? { host_meta_endpoint: `${origin}/pups/host-meta` } : {},
     ...options.postFallback ? { post_endpoint: `${origin}/pups/post` } : {},
@@ -55,6 +57,7 @@ export function createMockServer(options: MockOptions = {}) {
   const grants: Grant[] = []
   const discarded = new Set<string>()
   const files = new Map<string, StoredFile>()
+  const cached = new Map<string, StoredFile>()
   const hostMeta: { links: Record<string, unknown>[]; properties: Record<string, string> } = {
     links: [{ rel: 'https://bigwide.net/ns/personal-storage', href: `${origin}/personal-storage.json` }],
     properties: {},
@@ -71,6 +74,8 @@ export function createMockServer(options: MockOptions = {}) {
     dropNextRefreshResponse: false,
     /** Fail the next n refreshes with a network error before processing them. */
     failRefreshes: 0,
+    /** Simulate a cache in front of the server: public reads keep returning the version they saw first. */
+    cachePublicReads: false,
     me: `${origin}/`,
   }
 
@@ -181,10 +186,19 @@ export function createMockServer(options: MockOptions = {}) {
     if (path == '/pups/host-meta') {
       const grant = grantForAccess(request.headers.get('Authorization')?.slice(7) ?? '')
       if (!grant) return apiError(401, 'invalid_token')
-      const body = await request.json() as Record<string, string>
+      const body = await request.json() as Record<string, any>
       if (body.action == 'add') {
-        hostMeta.links.push({ rel: body.rel, href: body.href, type: body.type, properties: { 'https://bigwide.net/ns/pups#client': grant.clientId } })
+        hostMeta.links = hostMeta.links.filter(l => l.rel != body.rel || l.href != body.href)
+        hostMeta.links.push({ rel: body.rel, href: body.href, type: body.type, ...body.titles && { titles: body.titles },
+          properties: { ...body.properties, 'https://bigwide.net/ns/pups#client': grant.clientId } })
         return json(201, {})
+      }
+      if (body.action == 'order') {
+        const others = hostMeta.links.filter(l => l.rel != body.rel)
+        const mine = (body.hrefs as string[]).map(h => hostMeta.links.find(l => l.rel == body.rel && l.href == h))
+        if (mine.some(l => !l) || mine.length != hostMeta.links.length - others.length) return apiError(409, 'conflict')
+        hostMeta.links = [...others, ...mine as Record<string, unknown>[]]
+        return new Response(null, { status: 204 })
       }
       if (body.action == 'remove') {
         hostMeta.links = hostMeta.links.filter(l => l.rel != body.rel || l.href != body.href)
@@ -201,9 +215,15 @@ export function createMockServer(options: MockOptions = {}) {
     if (path.startsWith('/files/')) {
       const filePath = decodeURIComponent(path.slice('/files'.length))
       if (request.method == 'GET' || request.method == 'HEAD') {
-        const file = files.get(filePath)
+        const auth = request.headers.get('Authorization')
+        // A fresh read (RFC-6 "Fresh reads"): any valid token, the latest version, never cached.
+        if (auth && !grantForAccess(auth.slice(7)))
+          return new Response(null, { status: 401, headers: { 'WWW-Authenticate': 'Bearer error="invalid_token"' } })
+        let file = files.get(filePath)
+        if (!auth && state.cachePublicReads && file) file = cached.get(filePath) ?? cached.set(filePath, file).get(filePath)
         if (!file) return apiError(404, 'not_found')
-        return new Response(file.body.slice(), { status: 200, headers: { ETag: file.etag, 'Content-Type': file.type } })
+        const cacheControl = auth ? 'private, no-store' : 'no-cache'
+        return new Response(file.body.slice(), { status: 200, headers: { ETag: file.etag, 'Content-Type': file.type, 'Cache-Control': cacheControl, Vary: 'Authorization' } })
       }
       if (options.postFallback) return new Response('blocked by WAF', { status: 405 })
       const body = request.method == 'PUT' ? new Uint8Array(await request.arrayBuffer()) : undefined

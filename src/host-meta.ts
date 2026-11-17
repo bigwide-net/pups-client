@@ -10,6 +10,8 @@ export interface HostMetaLink {
   rel: string
   href?: string
   type?: string
+  /** A language tag or `default` → a title (RFC 7033). */
+  titles?: Record<string, string>
   properties?: Record<string, string | null>
   [field: string]: unknown
 }
@@ -92,16 +94,48 @@ export class HostMetaEditor {
     return [...new Set(properties)]
   }
 
+  /** The link properties allowed for links to the file `href` (a path or a public URL): those declared for its well-known path. */
+  allowedLinkProperties(href: string): string[] {
+    try {
+      return wellKnownEntryFor(this.#target(href).path, this.#session.server.wellKnownPaths)?.linkProperties ?? []
+    } catch {
+      return []
+    }
+  }
+
   /**
-   * Adds a link to one of the app's files. `href` may be a path (relative paths are in the app's own directory) or
-   * a public URL; it is sent as the public URL.
-   * @throws {PupsError} `insufficient_scope` if the file or rel isn't allowed, `conflict` if a single-valued rel is taken.
+   * Adds a link to one of the app's files, or changes it if the app added it before: its `type`, `titles` and
+   * `properties` are then replaced (omitted ones removed). `href` may be a path (relative paths are in the app's own
+   * directory) or a public URL; it is sent as the public URL. `titles` maps language tags or `default` to titles;
+   * `properties` may only hold the link properties declared for the file's well-known path.
+   * @throws {PupsError} `insufficient_scope` if the file, rel or a property isn't allowed, `conflict` if a single-valued
+   *   rel is taken or the link belongs to the owner or another app.
    */
-  async addLink(link: { rel: string; href: string; type?: string }, options: { signal?: AbortSignal } = {}): Promise<void> {
+  async addLink(link: { rel: string; href: string; type?: string; titles?: Record<string, string>; properties?: Record<string, string> },
+    options: { signal?: AbortSignal } = {}): Promise<void> {
     const { url } = this.#target(link.href)
     if (!this.allowsRel(link.rel, link.href))
       throw new PupsError('insufficient_scope', `The granted scopes don't allow the rel "${link.rel}" for ${url} (RFC-6, Links).`)
-    await this.#post({ action: 'add', rel: link.rel, href: url, ...link.type ? { type: link.type } : {} }, `Adding a ${link.rel} link`, options.signal)
+    const allowed = this.allowedLinkProperties(link.href)
+    const bad = Object.keys(link.properties ?? {}).find(p => !allowed.includes(p))
+    if (bad)
+      throw new PupsError('insufficient_scope', `The link property "${bad}" isn't allowed for ${url}. Allowed: ${allowed.join(', ') || 'none'} (RFC-6, Links).`)
+    await this.#post({
+      action: 'add', rel: link.rel, href: url, ...link.type ? { type: link.type } : {},
+      ...link.titles ? { titles: link.titles } : {}, ...link.properties ? { properties: link.properties } : {},
+    }, `Adding a ${link.rel} link`, options.signal)
+  }
+
+  /**
+   * Puts the links of `rel` into the order of `hrefs` (public URLs, or paths of files in the scopes). It must list
+   * every link of that rel in `host-meta.json` exactly once, the owner's and other apps' included; read them with
+   * {@link get} first.
+   * @throws {PupsError} `conflict` if `hrefs` doesn't match the current links, `insufficient_scope` if no granted
+   *   scope allows the rel.
+   */
+  async orderLinks(rel: string, hrefs: string[], options: { signal?: AbortSignal } = {}): Promise<void> {
+    const urls = hrefs.map(h => /^[a-z][a-z0-9+.-]*:/i.test(h) ? h : this.#target(h).url)
+    await this.#post({ action: 'order', rel, hrefs: urls }, `Ordering the ${rel} links`, options.signal)
   }
 
   /** Removes a link the app added. Links of the owner and of other apps are never touched by the server. */
@@ -135,7 +169,7 @@ export class HostMetaEditor {
     return { path, url: session.publicUrl(path) }
   }
 
-  async #post(body: Record<string, string>, what: string, signal?: AbortSignal) {
+  async #post(body: Record<string, unknown>, what: string, signal?: AbortSignal) {
     const endpoint = this.#session.server.hostMetaEndpoint
     if (!endpoint) throw new PupsError('unsupported', `${new URL(this.#session.server.domain).host}'s server can't edit host-meta.json.`)
     const response = await this.#session._authorized(endpoint, {

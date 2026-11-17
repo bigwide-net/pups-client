@@ -83,6 +83,10 @@ await session.update('feed.json', async file => {                  // safe read-
 await session.delete('notes/today.md')
 
 await session.hostMeta.addLink({ rel: 'https://app.example/rel/index', href: 'index.json' })
+// A page of the site (scope write:/pups/pages/), hidden, with a title; then the order of all pages
+await session.hostMeta.addLink({ rel: 'https://bigwide.net/ns/webpup-pages', href: '/pups/pages/imprint.md', type: 'text/markdown',
+  titles: { default: 'Imprint' }, properties: { 'https://bigwide.net/ns/webpup-hidden': 'true' } })
+await session.hostMeta.orderLinks('https://bigwide.net/ns/webpup-pages', [/* every page link's href, from hostMeta.get() */])
 await session.logout()
 ```
 
@@ -139,6 +143,7 @@ const feeds = await session.listFeeds()                           // the feeds r
 - **Storage**: sessions in IndexedDB, encrypted with a non-extractable AES-GCM key. This protects stored data, not against script injected into your page (XSS); use a strict Content Security Policy.
 - **RFC rules before sending**: paths, file types, scopes and size, with the same error codes the server uses.
 - **ETags** for safe concurrent edits, and the **POST fallback** for servers behind firewalls that block `PUT`.
+- **Fresh reads**: `get()` sends the token, so CDNs and caching proxies never hand back an old version, and the user sees their changes immediately. `get(path, { fresh: false })` reads without a token.
 
 ### Native apps and custom flows
 

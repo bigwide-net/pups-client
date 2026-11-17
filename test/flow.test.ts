@@ -155,6 +155,35 @@ describe('files', () => {
     expect(await session.update('new.json', () => undefined)).toBeUndefined()
   })
 
+  it('get() reads the latest version past a cache, unless fresh is false', async () => {
+    const { session, mock } = await connect()
+    mock.state.cachePublicReads = true
+    await session.put('a.json', '1')
+    expect(await (await session.get('a.json', { fresh: false }))!.text()).toBe('1')
+    const { etag } = await session.put('a.json', '2')
+    const fresh = (await session.get('a.json'))!
+    expect([await fresh.text(), fresh.etag]).toEqual(['2', etag])
+    expect(await (await session.get('a.json', { fresh: false }))!.text()).toBe('1')
+  })
+
+  it('update() works behind a cache that keeps serving an old version', async () => {
+    const { session, mock } = await connect()
+    mock.state.cachePublicReads = true
+    await session.put('list.json', '[]')
+    await session.get('list.json', { fresh: false })
+    for (const item of ['a', 'b'])
+      await session.update('list.json', async file => [...await file!.json() as string[], item], { maxAttempts: 1 })
+    expect(await (await session.get('list.json'))!.json()).toEqual(['a', 'b'])
+  })
+
+  it('fresh reads work with an identify-only session', async () => {
+    const { session, mock } = await connect({ scopes: ['identify'] })
+    mock.state.files.set('/appdata/app.example/x.json', { body: new TextEncoder().encode('{}'), type: 'application/json', etag: '"x"' })
+    expect((await session.get('x.json'))!.etag).toBe('"x"')
+    const reads = mock.state.requests.filter(r => r.url.endsWith('/x.json'))
+    expect(reads).toHaveLength(1)
+  })
+
   it('sends writes through the POST fallback when declared', async () => {
     const { session, mock } = await connect({ postFallback: true })
     await session.put('a.json', '{}')
@@ -185,6 +214,20 @@ describe('host-meta.json', () => {
     await session.hostMeta.setProperty('https://bigwide.net/ns/name', 'Tim')
     expect(mock.state.hostMeta.properties['https://bigwide.net/ns/name']).toBe('Tim')
     expect(await errorCode(session.hostMeta.setProperty('https://bigwide.net/ns/name', 'a\nb'))).toBe('invalid_request')
+  })
+
+  it('adds pages with titles and link properties, and orders them', async () => {
+    const { session, mock } = await connect({ scopes: ['write:/pups/pages/'] })
+    const rel = 'https://bigwide.net/ns/webpup-pages', hidden = 'https://bigwide.net/ns/webpup-hidden'
+    const url = (n: string) => `https://tim.example.com/pups/pages/${n}.md`
+    expect(session.hostMeta.allowedLinkProperties('/pups/pages/now.md')).toEqual([hidden])
+    await session.hostMeta.addLink({ rel, href: '/pups/pages/now.md', type: 'text/markdown' })
+    await session.hostMeta.addLink({ rel, href: '/pups/pages/imprint.md', titles: { default: 'Imprint' }, properties: { [hidden]: 'true' } })
+    expect(mock.state.hostMeta.links.at(-1)).toMatchObject({ href: url('imprint'), titles: { default: 'Imprint' }, properties: { [hidden]: 'true' } })
+    expect(await errorCode(session.hostMeta.addLink({ rel, href: '/pups/pages/x.md', properties: { 'https://bigwide.net/ns/other': 'x' } }))).toBe('insufficient_scope')
+    await session.hostMeta.orderLinks(rel, ['/pups/pages/imprint.md', url('now')])
+    expect(mock.state.hostMeta.links.filter(l => l.rel == rel).map(l => l.href)).toEqual([url('imprint'), url('now')])
+    expect(await errorCode(session.hostMeta.orderLinks(rel, [url('now')]))).toBe('conflict')
   })
 
   it('is unsupported without a host_meta_endpoint', async () => {

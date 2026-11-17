@@ -272,7 +272,7 @@ interface PupsSession {
   publicUrl(path: string): string  // the URL readers use, e.g. for an RFC-4 webmention source
   storageUrl(path: string): string
 
-  get(path: string, options?: { signal?: AbortSignal }): Promise<StoredFile | undefined>
+  get(path: string, options?: { signal?: AbortSignal; fresh?: boolean }): Promise<StoredFile | undefined>
   put(path: string, body: Body, options?: WriteOptions): Promise<WriteResult>
   create(path: string, body: Body, options?: WriteOptions): Promise<WriteResult>
   replace(path: string, body: Body, etag: string, options?: WriteOptions): Promise<WriteResult>
@@ -329,7 +329,7 @@ interface StoredFile {
 
 **Content types.** The extension decides the type, as in the RFC. Without `contentType`, the library sends the served type from the extension table (`.json` → `application/json`). With `contentType`, it must be one of the accepted types for the extension (e.g. `application/feed+json` for `.json`), or the call fails with `unsupported_type` before any request. A blocked extension anywhere in the name (`feed.php.json`) fails the same way.
 
-**Reads.** `get()` reads from `storage_base` without a token, because only ETags from `storage_base` are valid for conditions. It returns `undefined` on `404`.
+**Reads.** `get()` reads from `storage_base`, because only ETags from `storage_base` are valid for conditions. By default it is a **fresh read** (RFC-6 "Fresh reads"): it carries the access token, so that no CDN or caching proxy between the app and the server can answer with an old version, and the server returns the latest write with `Cache-Control: private, no-store`. Without it, a cache that kept an old version would make the user miss their own changes, and `update()` would fail with `412` on every attempt, because it would read the same old ETag each time. The token grants nothing else, since every stored file is public; any valid token works, `identify` included. `get(path, { fresh: false })` sends no token: it may be answered from a cache, but works without a valid session. `get()` returns `undefined` on `404`.
 
 ### `HostMetaEditor`
 

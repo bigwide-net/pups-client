@@ -168,17 +168,23 @@ export class PupsSession {
   }
 
   /**
-   * Reads a file from `storage_base`, without a token (everything stored is public). Use the ETag of the result
-   * for `replace()`; ETags from `public_base` may come from a CDN.
+   * Reads a file from `storage_base`. By default this is a fresh read (RFC-6 "Fresh reads"): it carries the access
+   * token, so that no cache between the app and the server can answer with an old version, and it returns the
+   * latest write. The token grants nothing else; every stored file is public. Use the ETag of the result for
+   * `replace()`; ETags from `public_base` may come from a CDN.
+   *
+   * With `fresh: false` the request carries no token. It may then be answered from a cache, but works without a
+   * valid session.
    * @returns undefined if the file doesn't exist.
+   * @throws {PupsError} `session_expired` for a fresh read if the session can't be renewed.
    */
-  async get(path: string, options: { signal?: AbortSignal } = {}): Promise<StoredFile | undefined> {
+  async get(path: string, options: { signal?: AbortSignal; fresh?: boolean } = {}): Promise<StoredFile | undefined> {
     const absolute = this.resolve(path)
     validatePath(absolute, this.server.wellKnownPaths)
-    const response = await fetchWithTimeout(this.#ctx.fetch, storageUrl(this.server, absolute), {
-      credentials: 'omit',
-      cache: 'no-store',
-    }, readTimeoutMs, options.signal)
+    const url = storageUrl(this.server, absolute)
+    const response = options.fresh ?? true
+      ? await this._authorized(url, {}, options.signal, readTimeoutMs)
+      : await fetchWithTimeout(this.#ctx.fetch, url, { credentials: 'omit', cache: 'no-store' }, readTimeoutMs, options.signal)
     if (response.status == 404) return
     if (!response.ok) throw await errorFromResponse(response, `GET ${absolute}`)
     const blob = await response.blob()
@@ -312,7 +318,7 @@ export class PupsSession {
    * The token is sent only to the server's write endpoints.
    * @internal
    */
-  async _authorized(url: string, init: RequestInit & { headers?: Record<string, string> }, signal?: AbortSignal): Promise<Response> {
+  async _authorized(url: string, init: RequestInit & { headers?: Record<string, string> }, signal?: AbortSignal, timeoutMs = writeTimeoutMs): Promise<Response> {
     const server = this.server
     const allowed = [server.storageBase, server.postEndpoint, server.hostMetaEndpoint].filter((u): u is string => !!u)
     if (!allowed.some(prefix => url.startsWith(prefix)))
@@ -324,7 +330,7 @@ export class PupsSession {
         headers: { ...init.headers, Authorization: `Bearer ${token}` },
         credentials: 'omit',
         cache: 'no-store',
-      }, writeTimeoutMs, signal)
+      }, timeoutMs, signal)
       if (response.status != 401 || attempt) return response
       token = await this._tokens.accessToken(token)
     }

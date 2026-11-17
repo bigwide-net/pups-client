@@ -19,6 +19,8 @@ export interface WellKnownPath {
   rels: string[]
   /** Top-level `host-meta.json` properties apps with this scope may set. */
   properties: string[]
+  /** Properties apps with this scope may set on their links to files under this path. */
+  linkProperties: string[]
 }
 
 /** A discovered and validated PUPS server: the configuration document, plus what discovery learned. Plain JSON data. */
@@ -153,6 +155,7 @@ export function parseConfig(json: unknown, domain: string, identityHosts: string
       ...url ? { url } : {},
       rels: e.rels === undefined ? [] : strings(`${field}.rels`, e.rels),
       properties: e.properties === undefined ? [] : strings(`${field}.properties`, e.properties),
+      linkProperties: e.link_properties === undefined ? [] : strings(`${field}.link_properties`, e.link_properties),
     }
   })
 
