@@ -64,21 +64,39 @@ export function wellKnownEntryFor(path: string, wellKnownPaths: readonly WellKno
   return best
 }
 
+/**
+ * Whether an absolute path is in a private area (RFC-6 "Private areas"): `/pups/private/…`, or the `private/`
+ * folder of an app's own directory, `/appdata/<client-host>/private/…`. Private files are read only with a token
+ * whose scope covers them, and have no public URL. Case-insensitive, like the servers, whose disk may be.
+ */
+export const isPrivate = (path: string) => /^\/(pups\/private\/|appdata\/[^/]+\/private\/[^/])/i.test(path)
+
 /** The URL where `path` is written (RFC-6 "Upload API"). */
 export const storageUrl = (server: PupsServer, path: string) => server.storageBase + encodePath(path).slice(1)
 
 /**
  * The URL where readers find `path` (RFC-6 "Public URLs"): `public_base` + path, or, for a file under a
  * well-known entry with a `url`, that `url` plus the rest of the path.
+ * @throws {PupsError} `invalid_path` for a private file, which has no public URL.
  */
 export function publicUrl(server: PupsServer, path: string): string {
+  if (isPrivate(path))
+    throw new PupsError('invalid_path', `${path} is private and has no public URL. Read it with get() (RFC-6, Private areas).`)
   const entry = wellKnownEntryFor(path, server.wellKnownPaths)
   if (entry?.url) return entry.url + encodePath(path.slice(entry.path.length))
   return server.publicBase + encodePath(path).slice(1)
 }
 
-/** The path of a public URL, the reverse of {@link publicUrl}, or undefined if the URL is not a file of this server. */
+/**
+ * The path of a public URL, the reverse of {@link publicUrl}, or undefined if the URL is not a public file of this
+ * server. Private files have no public URL, so a URL that maps to one is not a public file either.
+ */
 export function pathFromPublicUrl(server: PupsServer, url: string): string | undefined {
+  const path = mapPublicUrl(server, url)
+  return path && !isPrivate(path) ? path : undefined
+}
+
+function mapPublicUrl(server: PupsServer, url: string): string | undefined {
   try {
     const entries = server.wellKnownPaths.filter(w => w.url).sort((a, b) => b.url!.length - a.url!.length)
     for (const entry of entries)

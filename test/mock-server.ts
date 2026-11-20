@@ -3,7 +3,7 @@ import { sha256Base64url } from '../src/util.js'
 /**
  * An in-memory PUPS server for tests, as a `fetch` function. Implements discovery, the authorization code flow
  * (consent is simulated by `authorize()`), refresh with rotation, reuse detection and the grace period, revocation,
- * the upload API (or the POST fallback) and the host-meta endpoint.
+ * the upload API (or the POST fallback), private files (RFC-6 "Private areas") and the host-meta endpoint.
  */
 export interface MockOptions {
   domain?: string
@@ -39,13 +39,14 @@ export function createMockServer(options: MockOptions = {}) {
     revocation_endpoint: `${origin}/oauth/revoke`,
     storage_base: `${origin}/files/`,
     public_base: `${origin}/files/`,
-    scopes_supported: ['identify', 'write:/appdata/'],
+    scopes_supported: ['identify', 'write:/appdata/', 'write:/pups/private/notes/', 'read:/pups/private/notes/'],
     well_known_paths: [
       { path: '/feed.json', url: `${origin}/feed.json`, rels: ['https://bigwide.net/ns/feed'] },
       { path: '/feed/', url: `${origin}/feed/`, rels: ['https://bigwide.net/ns/feed'] },
       { path: '/.well-known/about.md', url: `${origin}/.well-known/about.md`, properties: ['https://bigwide.net/ns/name'] },
       { path: '/pups/pages/', url: `${origin}/pups/pages/`, rels: ['https://bigwide.net/ns/webpup-pages'],
         properties: ['https://bigwide.net/ns/webpup-footer'], link_properties: ['https://bigwide.net/ns/webpup-hidden'] },
+      { path: '/pups/private/notes/' },
     ],
     ...options.hostMetaEndpoint ?? true ? { host_meta_endpoint: `${origin}/pups/host-meta` } : {},
     ...options.postFallback ? { post_endpoint: `${origin}/pups/post` } : {},
@@ -99,11 +100,15 @@ export function createMockServer(options: MockOptions = {}) {
     return grant
   }
 
-  const covers = (scopes: string[], path: string) => scopes.some(s => {
-    if (!s.startsWith('write:')) return false
-    const p = decodeURIComponent(s.slice(6))
+  /** Whether a scope of one of `kinds` covers `path`. */
+  const covers = (scopes: string[], path: string, kinds = ['write']) => scopes.some(s => {
+    const i = s.indexOf(':')
+    if (!kinds.includes(s.slice(0, i))) return false
+    const p = decodeURIComponent(s.slice(i + 1))
     return p.endsWith('/') ? path.startsWith(p) : path == p
   })
+  const isPrivate = (path: string) => /^\/(pups\/private\/|appdata\/[^/]+\/private\/[^/])/i.test(path)
+  const PRIVATE = { 'Cache-Control': 'no-store', Vary: 'Authorization' }
 
   async function tokenEndpoint(body: URLSearchParams): Promise<Response> {
     if (body.get('grant_type') == 'authorization_code') {
@@ -216,9 +221,15 @@ export function createMockServer(options: MockOptions = {}) {
       const filePath = decodeURIComponent(path.slice('/files'.length))
       if (request.method == 'GET' || request.method == 'HEAD') {
         const auth = request.headers.get('Authorization')
+        const priv = isPrivate(filePath)
+        // Private files: decided before looking for the file, and never cached (RFC-6 "Private areas").
+        if (priv && !auth) return json(401, { error: 'invalid_token' }, { ...PRIVATE, 'WWW-Authenticate': 'Bearer' })
         // A fresh read (RFC-6 "Fresh reads"): any valid token, the latest version, never cached.
-        if (auth && !grantForAccess(auth.slice(7)))
-          return new Response(null, { status: 401, headers: { 'WWW-Authenticate': 'Bearer error="invalid_token"' } })
+        const grant = auth ? grantForAccess(auth.slice(7)) : undefined
+        if (auth && !grant)
+          return new Response(null, { status: 401, headers: { 'WWW-Authenticate': 'Bearer error="invalid_token"', ...priv && PRIVATE } })
+        if (priv && !covers(grant!.scopes, filePath, ['write', 'read'])) return json(403, { error: 'insufficient_scope' }, PRIVATE)
+        if (priv && !files.has(filePath)) return json(404, { error: 'not_found' }, PRIVATE)
         let file = files.get(filePath)
         if (!auth && state.cachePublicReads && file) file = cached.get(filePath) ?? cached.set(filePath, file).get(filePath)
         if (!file) return apiError(404, 'not_found')

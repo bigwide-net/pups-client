@@ -64,6 +64,15 @@ export interface FeedItem {
   tags?: string[]
   language?: string
   attachments?: FeedAttachment[]
+  /** The item's `_pups` object, with its index (RFC-7 "Indexes"). */
+  _pups?: ItemMarker
+  [field: string]: unknown
+}
+
+/** The `_pups` object of an item. */
+export interface ItemMarker {
+  /** The item's index: 0 for a feed's first item, then counting up; never changed, never used again (RFC-7 "Indexes"). */
+  index?: number
   [field: string]: unknown
 }
 
@@ -75,6 +84,11 @@ export interface PupsMarker {
   archive_url?: string
   /** In an archive: the public URL of the feed file, which readers poll. */
   updates_url?: string
+  /**
+   * The index the next new item gets (RFC-7 "Indexes"). Valid in the newest archive, or in the feed file of a feed
+   * without archives.
+   */
+  next_index?: number
   [field: string]: unknown
 }
 
@@ -160,6 +174,8 @@ export type PostChanges = { [K in Exclude<keyof PostInput, 'id'>]?: PostInput[K]
 
 export interface PostResult {
   id: string
+  /** The item's index (RFC-7 "Indexes"); undefined for an item that has none yet. */
+  index?: number
   /** The item as stored. */
   item: FeedItem
   /**
@@ -275,6 +291,40 @@ function mergeItems(existing: FeedItem[], incoming: FeedItem[]): FeedItem[] {
   const byId = new Map(incoming.map(item => [item.id, item]))
   const present = new Set(existing.map(item => item.id))
   return [...incoming.filter(item => !present.has(item.id)), ...existing.map(item => byId.get(item.id) ?? item)]
+}
+
+/** The index of an item (RFC-7 "Indexes"), or undefined if it has none. */
+export function itemIndex(item: FeedItem): number | undefined {
+  const index = isObject(item._pups) ? item._pups.index : undefined
+  return typeof index == 'number' && Number.isSafeInteger(index) && index >= 0 ? index : undefined
+}
+
+const withIndex = (item: FeedItem, index: number): FeedItem => ({ ...item, _pups: { ...isObject(item._pups) ? item._pups : {}, index } })
+
+/** The counter `_pups.next_index` of a file, if it has a valid one. */
+function counterOf(doc: FeedDocument): number | undefined {
+  const next = doc._pups?.next_index
+  return typeof next == 'number' && Number.isSafeInteger(next) && next >= 0 ? next : undefined
+}
+
+/** The next free index: above every index of `items`, and at least each of `counters`. */
+const nextFree = (items: FeedItem[], ...counters: (number | undefined)[]) =>
+  Math.max(0, ...counters.filter((c): c is number => c !== undefined), ...items.map(item => (itemIndex(item) ?? -1) + 1))
+
+/**
+ * Gives the items without an index (newest first, as in a file) the next indexes from `next`, the oldest first
+ * (RFC-7 "Items without an index").
+ * @returns the items, and the counter after them.
+ */
+function indexItems(items: FeedItem[], next: number): { items: FeedItem[]; next: number; changed: boolean } {
+  const result = [...items]
+  let changed = false
+  for (let i = result.length - 1; i >= 0; i--)
+    if (itemIndex(result[i]!) === undefined) {
+      result[i] = withIndex(result[i]!, next++)
+      changed = true
+    }
+  return { items: result, next, changed }
 }
 
 /** Every string inside `value`, deeply. */
@@ -479,6 +529,7 @@ export class PupsFeed {
     const item = this.#newItem(input)
     const signal = options.signal
     let archiveUrl = ''
+    let stored = item
     let firstAttempt = true
     await this.#transaction(async () => {
       const main = await this.#readControlled(this.path, signal)
@@ -489,24 +540,57 @@ export class PupsFeed {
       const doc: FeedDocument = { ...main.doc, _pups: { ...main.doc._pups } }
       const hasArchives = this.#archiveNumber(doc._pups!.archive_url) !== undefined
       if (!hasArchives && !this.#archivesWanted) {
-        // A feed without archives: the feed file is all there is (RFC-7 "Posting").
+        // A feed without archives: the feed file is all there is, and holds the counter (RFC-7 "Posting").
         archiveUrl = this.url
-        await this.#writeMain({ ...doc, items: this.#newestItems([item], doc.items, doc) }, main.etag, signal)
+        const indexed = indexItems(doc.items, nextFree(doc.items, counterOf(doc)))
+        stored = withIndex(item, indexed.next)
+        doc._pups!.next_index = indexed.next + 1
+        await this.#writeMain({ ...doc, items: this.#newestItems([stored], indexed.items, doc) }, main.etag, signal)
         return
       }
       if (!hasArchives) {
         const started = await this.#startArchives(main, signal)
-        if (started) doc._pups!.archive_url = started
+        if (started) {
+          doc._pups!.archive_url = started.url
+          doc.items = started.items
+        }
       }
       const added = await this.#addToArchive(main, doc, item, signal)
       archiveUrl = added.url
+      stored = added.item
       doc._pups!.archive_url = added.url
-      // The old chain of a handed-over feed now continues behind the oldest archive.
-      if (!hasArchives) delete doc.next_url
+      if (!hasArchives) {
+        // The old chain of a handed-over feed now continues behind the oldest archive, and the newest archive
+        // holds the counter.
+        delete doc.next_url
+        delete doc._pups!.next_index
+      }
       doc.items = this.#newestItems(added.recent, doc.items, doc)
       await this.#writeMain(doc, main.etag, signal)
     })
-    return this.#result(item, archiveUrl)
+    return this.#result(stored, archiveUrl)
+  }
+
+  /**
+   * Gives every item of the feed without an index one (RFC-7 "Indexing an existing feed"), and sets the counter.
+   * `addPost()` does this by itself before the first post to a feed that hasn't been indexed yet; call it to
+   * index a feed without posting.
+   */
+  async assignIndexes(options: Signal = {}): Promise<void> {
+    const signal = options.signal
+    await this.#transaction(async () => {
+      const main = await this.#readControlled(this.path, signal)
+      const newest = this.#archiveNumber(main.doc._pups?.archive_url)
+      if (newest === undefined) {
+        const indexed = indexItems(main.doc.items, nextFree(main.doc.items, counterOf(main.doc)))
+        if (indexed.changed || counterOf(main.doc) !== indexed.next)
+          await this.#writeMain({ ...main.doc, items: indexed.items, _pups: { ...main.doc._pups, next_index: indexed.next } }, main.etag, signal)
+        return
+      }
+      const archive = await this.#readArchive(this.#archivePath(newest), signal)
+      if (archive && archive != 'foreign' && (counterOf(archive.doc) === undefined || archive.doc.items.some(item => itemIndex(item) === undefined)))
+        await this.#indexArchives(main, signal)
+    })
   }
 
   /**
@@ -552,7 +636,10 @@ export class PupsFeed {
       const fileUrl = this.#session.publicUrl(file.path)
       const changed = typeof changes == 'function' ? await changes(clone(old)) : this.#applyChanges(clone(old), changes)
       if (!changed) return this.#result(old, fileUrl)
-      const item: FeedItem = { ...changed, id, date_modified: now() }
+      const oldIndex = itemIndex(old)
+      let item: FeedItem = { ...changed, id, date_modified: now() }
+      // The index never changes (RFC-7 "Indexes").
+      if (oldIndex !== undefined) item = withIndex(item, oldIndex)
       if (file != main) await this.#writeArchive(file, replaceAt(file.doc.items, index, item), signal)
       const mainIndex = main.doc.items.findIndex(i => i.id == id)
       if (mainIndex >= 0) await this.#writeMain({ ...main.doc, items: replaceAt(main.doc.items, mainIndex, item) }, main.etag, signal)
@@ -706,8 +793,10 @@ export class PupsFeed {
     return fixed
   }
 
-  async #writeArchive(archive: Loaded, items: FeedItem[], signal?: AbortSignal) {
-    await this.#session.replace(archive.path, serialize({ ...archive.doc, items }), archive.etag, { contentType: FEED_CONTENT_TYPE, signal })
+  /** Writes an archive with `items`, and with the counter `next_index` if given. */
+  async #writeArchive(archive: Loaded, items: FeedItem[], signal?: AbortSignal, nextIndex?: number) {
+    const doc = nextIndex === undefined ? { ...archive.doc, items } : { ...archive.doc, items, _pups: { ...archive.doc._pups, next_index: nextIndex } }
+    await this.#session.replace(archive.path, serialize(doc), archive.etag, { contentType: FEED_CONTENT_TYPE, signal })
   }
 
   /**
@@ -742,9 +831,9 @@ export class PupsFeed {
   }
 
   /** A new archive with the feed fields of the feed file (RFC-7 "Archives"). */
-  #newArchive(n: number, main: FeedDocument, items: FeedItem[], nextUrl: string | undefined): FeedDocument {
+  #newArchive(n: number, main: FeedDocument, items: FeedItem[], nextUrl: string | undefined, nextIndex?: number): FeedDocument {
     const { items: _items, next_url: _next, user_comment: _comment, hubs: _hubs, author: _author, _pups, ...fields } = main
-    const { archive_url: _archive, ...marker } = _pups ?? {}
+    const { archive_url: _archive, next_index: _counter, ...marker } = _pups ?? {}
     const podcast = fields._podcast
     if (isObject(podcast) && 'liveItems' in podcast) {
       const { liveItems: _live, ...rest } = podcast
@@ -758,12 +847,12 @@ export class PupsFeed {
       user_comment: archiveComment(this.url),
       ...nextUrl ? { next_url: nextUrl } : {},
       items,
-      _pups: { about: PUPS_FEED_SPEC, ...marker, pupsControlled: true, updates_url: this.url },
+      _pups: { about: PUPS_FEED_SPEC, ...marker, pupsControlled: true, updates_url: this.url, ...nextIndex === undefined ? {} : { next_index: nextIndex } },
     }
   }
 
-  async #createArchive(n: number, main: FeedDocument, items: FeedItem[], nextUrl: string | undefined, signal?: AbortSignal) {
-    await this.#session.create(this.#archivePath(n), serialize(this.#newArchive(n, main, items, nextUrl)), { contentType: FEED_CONTENT_TYPE, signal })
+  async #createArchive(n: number, main: FeedDocument, items: FeedItem[], nextUrl: string | undefined, signal?: AbortSignal, nextIndex?: number) {
+    await this.#session.create(this.#archivePath(n), serialize(this.#newArchive(n, main, items, nextUrl, nextIndex)), { contentType: FEED_CONTENT_TYPE, signal })
   }
 
   /**
@@ -782,17 +871,22 @@ export class PupsFeed {
 
   /**
    * Puts the items of a feed without archives into new archives of `archiveSize`, oldest first (RFC-7 "Starting the
-   * archives"). The oldest archive continues the feed's `next_url` chain.
-   * @returns the URL of the newest archive, or undefined if the feed has no items.
+   * archives"). The items get indexes first, and the newest archive the counter. The oldest archive continues the
+   * feed's `next_url` chain.
+   * @returns the URL of the newest archive and the feed's items with their indexes, or undefined if the feed has no
+   *   items.
    */
-  async #startArchives(main: Loaded, signal?: AbortSignal): Promise<string | undefined> {
-    const oldestFirst = [...main.doc.items].reverse()
+  async #startArchives(main: Loaded, signal?: AbortSignal): Promise<{ url: string; items: FeedItem[] } | undefined> {
+    const indexed = indexItems(main.doc.items, nextFree(main.doc.items, counterOf(main.doc)))
+    const oldestFirst = [...indexed.items].reverse()
+    const count = Math.ceil(oldestFirst.length / this.#archiveSize)
     let url: string | undefined
-    for (let n = 0; n * this.#archiveSize < oldestFirst.length; n++) {
+    for (let n = 0; n < count; n++) {
       const items = oldestFirst.slice(n * this.#archiveSize, (n + 1) * this.#archiveSize).reverse()
       const nextUrl = n ? this.#archiveUrl(n - 1) : main.doc.next_url
+      const nextIndex = n == count - 1 ? indexed.next : undefined
       try {
-        await this.#createArchive(n, main.doc, items, nextUrl, signal)
+        await this.#createArchive(n, main.doc, items, nextUrl, signal, nextIndex)
       } catch (e) {
         if (!isPupsError(e, 'precondition_failed')) throw e
         // Left behind by an interrupted start: complete it, as long as it holds only these items.
@@ -800,53 +894,106 @@ export class PupsFeed {
         const ids = new Set(items.map(item => item.id))
         if (!existing || existing == 'foreign' || !existing.doc.items.every(item => ids.has(item.id)))
           throw new PupsError('conflict', `${this.#archivePath(n)} exists already, but ${this.path} has no archive_url. Remove the file, or set _pups.archive_url (RFC-7, Starting the archives).`)
-        await this.#writeArchive(existing, items, signal)
+        await this.#writeArchive(existing, items, signal, nextIndex)
       }
       url = this.#archiveUrl(n)
     }
-    return url
+    return url ? { url, items: indexed.items } : undefined
+  }
+
+  /**
+   * Indexes a feed with archives whose newest archive has no counter, or items without an index (RFC-7 "Indexing an
+   * existing feed"): gives every archived item without an index one, the oldest first, writes the changed archives
+   * from the oldest to the newest, the newest with the counter, and then the feed file's copies.
+   */
+  async #indexArchives(main: Loaded, signal?: AbortSignal): Promise<void> {
+    const files: Loaded[] = []
+    for await (const file of this.#chain(main, signal)) {
+      // Pages behind the oldest archive of a handed-over feed are never written, and keep their items unindexed.
+      if (file == main || !isControlled(file.doc)) break
+      files.push(file)
+    }
+    if (!files.length) return
+    let next = nextFree(files.flatMap(file => file.doc.items), ...files.map(file => counterOf(file.doc)))
+    const indexes = new Map<string, number>()
+    for (const file of [...files].reverse()) {
+      const indexed = indexItems(file.doc.items, next)
+      next = indexed.next
+      for (const item of indexed.items) indexes.set(item.id, itemIndex(item)!)
+      const newest = file == files[0]
+      if (indexed.changed || (newest && counterOf(file.doc) !== next)) await this.#writeArchive(file, indexed.items, signal, newest ? next : undefined)
+    }
+    let changed = false
+    const items = main.doc.items.map(item => {
+      const index = indexes.get(item.id)
+      if (index === undefined || itemIndex(item) === index) return item
+      changed = true
+      return withIndex(item, index)
+    })
+    if (changed) await this.#writeMain({ ...main.doc, items }, main.etag, signal)
   }
 
   /**
    * Adds an item to the newest archive, or to a new archive if the newest holds `archiveSize` items (RFC-7
    * "Posting"). Writes only archives; the caller writes the feed file afterwards.
-   * @returns the archive's URL, and the newest items known from the archives, newest first.
+   * The item gets its index from the archive's counter (RFC-7 "Indexes"); a newest archive without a counter is
+   * indexed first, and the post then starts again.
+   * @returns the archive's URL, the newest items known from the archives, newest first, and the item as stored.
    */
-  async #addToArchive(main: Loaded, doc: FeedDocument, item: FeedItem, signal?: AbortSignal): Promise<{ url: string; recent: FeedItem[] }> {
+  async #addToArchive(main: Loaded, doc: FeedDocument, item: FeedItem, signal?: AbortSignal): Promise<{ url: string; recent: FeedItem[]; item: FeedItem }> {
     const newest = this.#archiveNumber(doc._pups?.archive_url)
     let previous: FeedItem[] = []
+    // The index for the item if it goes into a new archive.
+    let next = nextFree(doc.items, newest === undefined ? counterOf(doc) : undefined)
     if (newest !== undefined) {
       const existing = await this.#readArchive(this.#archivePath(newest), signal)
       if (!existing) {
-        // The owner deleted it: create it again, linked to the next older archive.
-        await this.#createArchive(newest, doc, [item], newest ? this.#archiveUrl(newest - 1) : undefined, signal)
-        return { url: this.#archiveUrl(newest), recent: [item] }
+        // The owner deleted it: create it again, linked to the next older archive, with an index above all known ones.
+        const before = newest ? await this.#readArchive(this.#archivePath(newest - 1), signal) : undefined
+        if (before && before != 'foreign') next = nextFree([...doc.items, ...before.doc.items], counterOf(before.doc))
+        const stored = withIndex(item, next)
+        await this.#createArchive(newest, doc, [stored], newest ? this.#archiveUrl(newest - 1) : undefined, signal, next + 1)
+        return { url: this.#archiveUrl(newest), recent: [stored], item: stored }
       }
       if (existing != 'foreign') {
-        const merged = mergeItems(existing.doc.items, [item])
-        if (merged.length <= this.#archiveSize) {
-          await this.#writeArchive(existing, merged, signal)
-          return { url: this.#archiveUrl(newest), recent: merged }
+        if (counterOf(existing.doc) === undefined) {
+          await this.#indexArchives(main, signal)
+          throw conflict(`${this.path} was indexed, so it`)
         }
-        previous = existing.doc.items
+        // Items that a client without indexes added get theirs first (RFC-7 "Items without an index").
+        const indexed = indexItems(existing.doc.items, nextFree(existing.doc.items, counterOf(existing.doc)))
+        const copy = indexed.items.find(i => i.id == item.id)
+        const stored = withIndex(item, copy ? itemIndex(copy)! : indexed.next)
+        const merged = mergeItems(indexed.items, [stored])
+        if (merged.length <= this.#archiveSize) {
+          await this.#writeArchive(existing, merged, signal, copy ? indexed.next : indexed.next + 1)
+          return { url: this.#archiveUrl(newest), recent: merged, item: stored }
+        }
+        if (indexed.changed) await this.#writeArchive(existing, indexed.items, signal, indexed.next)
+        previous = indexed.items
+        next = indexed.next
       }
     }
     // The archive before the new one: the newest, or for a feed without archives the end of its old chain.
     const nextUrl = newest === undefined ? doc.next_url : this.#archiveUrl(newest)
     for (let n = newest === undefined ? 0 : newest + 1; n <= maxArchiveNumber; n++) {
+      const stored = withIndex(item, next)
       try {
-        await this.#createArchive(n, doc, [item], nextUrl, signal)
-        return { url: this.#archiveUrl(n), recent: [item, ...previous] }
+        await this.#createArchive(n, doc, [stored], nextUrl, signal, next + 1)
+        return { url: this.#archiveUrl(n), recent: [stored, ...previous], item: stored }
       } catch (e) {
         if (!isPupsError(e, 'precondition_failed')) throw e
       }
       // The archive exists: left behind by an interrupted client, or created by another client just now.
       const existing = await this.#readArchive(this.#archivePath(n), signal)
       if (existing && existing != 'foreign' && existing.doc.next_url == nextUrl) {
-        const merged = mergeItems(existing.doc.items, [item])
+        const indexed = indexItems(existing.doc.items, nextFree(existing.doc.items, counterOf(existing.doc), next))
+        const copy = indexed.items.find(i => i.id == item.id)
+        const added = withIndex(item, copy ? itemIndex(copy)! : indexed.next)
+        const merged = mergeItems(indexed.items, [added])
         if (merged.length <= this.#archiveSize) {
-          await this.#writeArchive(existing, merged, signal)
-          return { url: this.#archiveUrl(n), recent: [...merged, ...previous] }
+          await this.#writeArchive(existing, merged, signal, copy ? indexed.next : indexed.next + 1)
+          return { url: this.#archiveUrl(n), recent: [...merged, ...previous], item: added }
         }
       }
       const current = await this.#session.get(this.path, { signal })
@@ -869,6 +1016,12 @@ export class PupsFeed {
     if (markdown !== undefined) this.#setMarkdown(item, markdown)
     if (item.content_html === undefined && item.content_text === undefined)
       throw new PupsError('invalid_request', 'A post needs content_html, content_text or markdown (JSON Feed requires content).')
+    // The index is given out when the item is added (RFC-7 "Indexes").
+    if (isObject(item._pups)) {
+      const { index: _index, ...marker } = item._pups
+      if (Object.keys(marker).length) item._pups = marker
+      else delete item._pups
+    }
     return item
   }
 
@@ -900,7 +1053,8 @@ export class PupsFeed {
   }
 
   #result(item: FeedItem, fileUrl: string): PostResult {
-    return { id: item.id, item, url: `${fileUrl}#${encodeURIComponent(item.id)}` }
+    const index = itemIndex(item)
+    return { id: item.id, ...index === undefined ? {} : { index }, item, url: `${fileUrl}#${encodeURIComponent(item.id)}` }
   }
 
   /**
@@ -935,7 +1089,8 @@ export class PupsFeed {
     const path = `${this.directory}${prefix}${randomString(9)}.${extension}`
     const result = await this.#session.create(path, body, { signal })
     const size = typeof body == 'string' ? byteLength(body) : body instanceof Blob ? body.size : (body as ArrayBuffer | ArrayBufferView).byteLength
-    return { path, url: result.url, type, size }
+    // Feed directories are public, so the result always has a URL.
+    return { path, url: result.url!, type, size }
   }
 
   async #setImage(field: 'icon' | 'favicon', media: MediaInput | null, signal?: AbortSignal): Promise<FeedDocument> {

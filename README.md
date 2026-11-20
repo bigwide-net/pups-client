@@ -5,7 +5,7 @@ The reference client for **Personal Upload Servers** (PUPS, [bigwide.net RFC-6](
 - **Browser library** in TypeScript, without runtime dependencies.
 - **Command line tool** `pups`, for uploading from a terminal or a script.
 
-PUPS lets any app write files to a user's domain, knowing nothing but the domain. The user approves the app at their own server with standard OAuth, and everything the app writes is published as static files.
+PUPS lets any app write files to a user's domain, knowing nothing but the domain. The user approves the app at their own server with standard OAuth, and everything the app writes is published as static files, except in the private areas that only the owner's apps can read.
 
 > Status: 0.1, implements RFC-6 `spec_version` 0.1. The RFC is a draft, so the API may still change.
 
@@ -47,6 +47,7 @@ Paths without a leading `/` are in the app's own directory, `/appdata/<client-do
 pups login tjansen.de -c tim.example.app -s appdata -s write:/.well-known/about.md -s write:/feed/photos.json
 pups put about.md --to /.well-known/about.md --if-match '"etag-you-read"'
 pups link add https://bigwide.net/ns/feed /feed/photos.json --type application/feed+json
+pups put settings.json --to private/                           # the app's private folder: only it can read the file
 ```
 
 Run `pups --help` for every command and option. Options can also come from `PUPS_CLIENT` and `PUPS_DOMAIN`.
@@ -103,6 +104,24 @@ Your app publishes its client metadata document on its own domain:
 
 During development, `await pups.checkClientMetadata()` reports everything a PUPS server would reject.
 
+### Private files
+
+Files in the app's private folder, `private/` in its own directory, can be read only by the app itself, with its token. The `appdata` scope covers them:
+
+```ts
+await session.put('private/settings.json', { theme: 'dark' })       // → /appdata/app.example/private/settings.json
+const settings = await (await session.get('private/settings.json'))?.json()
+```
+
+Private files that extensions of RFC-6 define in `/pups/private/`, such as an inbox, are shared by every app the owner allows. Ask for `read:/pups/private/<path>` to read them, or `write:/pups/private/<path>` to read and write them; the server must declare the path in `server.wellKnownPaths`.
+
+```ts
+const session = await pups.loginWithPopup(domain, { scopes: ['appdata', 'read:/pups/private/inbox.json'] })
+const inbox = await session.get('/pups/private/inbox.json')
+```
+
+Private files have no public URL: `publicUrl()` throws, `WriteResult.url` is absent, and they can't be linked in `host-meta.json`. `session.canRead(path)` and `session.isPrivate(path)` tell what the session may do. Private files are hidden from the public, not encrypted: whoever runs the server can read them.
+
 ### Feeds
 
 `session.feed()` maintains a blog feed, or any similar stream of posts, on the owner's domain, following [RFC-7](https://github.com/bigwide-net/RFCs/blob/main/RFC-7-Feed-Publishing-with-PUPS.md): the main feed `/feed.json`, or a named feed `/feed/<name>.json`, each a JSON Feed 1.1 with its archives, icons and media in a feed directory, `/feed/` or `/feed/<name>/`. Icons go into `/feed/images/icons/` (`/feed/<name>/images/icons/`), the main feed's media into `/feed/images/` and `/feed/media/`.
@@ -133,6 +152,7 @@ const feeds = await session.listFeeds()                           // the feeds r
 - **Archives.** Every post goes into the newest archive, `feed.000000.json`, `feed.000001.json`, … in the feed directory, 20 posts each, linked with `next_url`; posts never move. The feed file holds a copy of the newest 30 posts and points to the newest archive with `_pups.archive_url`; archives point back with `_pups.updates_url`. `session.feed(name, { maxItems, archiveSize, maxBytes })` changes the sizes. Archives are optional in RFC-7: with `{ startArchives: false }`, a feed without archives stays a plain feed file with the newest posts; a feed that has archives always keeps them.
 - **Concurrency.** Every change is a read-modify-write with ETags, repeated when another app or the owner wrote in between. The archive is always written before the feed file, so no post is ever lost, and the next post repairs a feed file that an interrupted post didn't reach.
 - **Post URLs.** `addPost()` returns `url`, the post's archive URL plus `#<id>`. It never changes, so it can be the `source` of an RFC-4 webmention.
+- **Indexes.** Every post gets an index, `_pups.index` (also `PostResult.index`, or `itemIndex(item)`): 0 for the first post, then counting up, never changed and never given out again, with the counter `_pups.next_index` in the newest archive. Readers can number the posts and load only the archives they need. A feed written before indexes existed is indexed on its next post, or with `feed.assignIndexes()`; posts of apps that don't know indexes get theirs on the next post.
 - Errors: `not_pups_controlled` for feeds without the marker, `invalid_feed` for files that aren't JSON Feeds, `not_found` for a missing feed or post.
 
 ### What the library does for you
@@ -143,7 +163,7 @@ const feeds = await session.listFeeds()                           // the feeds r
 - **Storage**: sessions in IndexedDB, encrypted with a non-extractable AES-GCM key. This protects stored data, not against script injected into your page (XSS); use a strict Content Security Policy.
 - **RFC rules before sending**: paths, file types, scopes and size, with the same error codes the server uses.
 - **ETags** for safe concurrent edits, and the **POST fallback** for servers behind firewalls that block `PUT`.
-- **Fresh reads**: `get()` sends the token, so CDNs and caching proxies never hand back an old version, and the user sees their changes immediately. `get(path, { fresh: false })` reads without a token.
+- **Fresh reads**: `get()` sends the token, so CDNs and caching proxies never hand back an old version, and the user sees their changes immediately. `get(path, { fresh: false })` reads without a token, except for private files, which always need it.
 
 ### Native apps and custom flows
 

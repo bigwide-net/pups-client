@@ -4,8 +4,11 @@ import { listFeeds, PupsFeed, type FeedLink, type FeedOptions } from './feed.js'
 import { fileTypeOf, uploadContentType } from './file-types.js'
 import { HostMetaEditor } from './host-meta.js'
 import { revokeToken } from './oauth.js'
-import { publicUrl, resolvePath, scopeCovers, storageUrl, validatePath } from './paths.js'
-import { appDataPathOf, clientHostOf, expandScopes, scopesCoverPath, writeScopePath, writeScopePaths, type Scope } from './scopes.js'
+import { isPrivate, publicUrl, resolvePath, scopeCovers, storageUrl, validatePath } from './paths.js'
+import {
+  appDataPathOf, clientHostOf, expandScopes, readScopePath, readScopePaths, scopesAllowReading, scopesCoverPath, writeScopePath,
+  writeScopePaths, type Scope,
+} from './scopes.js'
 import type { SessionRecord, TokenStore } from './store/token-store.js'
 import type { TabChannel } from './tabs.js'
 import { TokenManager } from './tokens.js'
@@ -38,8 +41,8 @@ export interface WriteResult {
   path: string
   /** The new ETag, for a later `replace()` or `delete()`. */
   etag: string
-  /** The public URL readers use. */
-  url: string
+  /** The public URL readers use; absent for a private file, which has none. */
+  url?: string
   /** Whether the file was created (`201`) rather than replaced (`200`). */
   created: boolean
 }
@@ -88,6 +91,11 @@ export class PupsSession {
   readonly clientHost: string
   /** The app's own directory, `/appdata/<client-host>/`. */
   readonly appDataPath: string
+  /**
+   * The app's private folder, `/appdata/<client-host>/private/` (RFC-6 "Private areas"). Only this app can read the
+   * files in it; relative paths starting with `private/` are in it.
+   */
+  readonly privatePath: string
   /** Edits `host-meta.json` through the server's host-meta endpoint. */
   readonly hostMeta: HostMetaEditor
   /** @internal */
@@ -100,6 +108,7 @@ export class PupsSession {
     this.clientId = record.clientId
     this.clientHost = clientHostOf(record.clientId)
     this.appDataPath = appDataPathOf(record.clientId)
+    this.privatePath = `${this.appDataPath}private/`
     this.#ctx = ctx
     this._tokens = new TokenManager(record, persistent, {
       fetch: ctx.fetch,
@@ -135,12 +144,16 @@ export class PupsSession {
     return this._tokens.active
   }
 
-  /** Whether a scope was granted. A `write:` directory scope also counts as granted if a parent directory was granted. */
+  /**
+   * Whether a scope was granted. A directory scope also counts as granted if a parent directory was granted, and a
+   * `read:` scope also if a `write:` scope covers it, since that allows reading too.
+   */
   hasScope(scope: Scope): boolean {
     const [expanded] = expandScopes([scope], this.clientId)
     if (expanded == 'identify') return this.scopes.includes('identify')
-    const path = writeScopePath(expanded!)
-    return path !== undefined && writeScopePaths(this.scopes).some(granted => scopeCovers(granted, path))
+    const read = readScopePath(expanded!)
+    const path = read ?? writeScopePath(expanded!)
+    return path !== undefined && (read === undefined ? writeScopePaths : readScopePaths)(this.scopes).some(granted => scopeCovers(granted, path))
   }
 
   /** Whether the granted scopes allow writing `path` (relative paths are in the app's own directory). */
@@ -152,12 +165,37 @@ export class PupsSession {
     }
   }
 
+  /**
+   * Whether the session may read `path`: every public file, and private files that a `write:` or `read:` scope covers
+   * (relative paths are in the app's own directory).
+   */
+  canRead(path: string): boolean {
+    try {
+      const absolute = this.resolve(path)
+      validatePath(absolute, this.server.wellKnownPaths)
+      return scopesAllowReading(this.scopes, absolute)
+    } catch {
+      return false
+    }
+  }
+
+  /**
+   * Whether `path` is private (RFC-6 "Private areas"): in the app's private folder `private/`, or in `/pups/private/`.
+   * Private files can be read only with this session's token, and have no public URL.
+   */
+  isPrivate(path: string): boolean {
+    return isPrivate(this.resolve(path))
+  }
+
   /** The absolute path for `path`: unchanged if it starts with `/`, otherwise inside the app's own directory. */
   resolve(path: string): string {
     return resolvePath(path, this.appDataPath)
   }
 
-  /** The public URL of `path`, as readers see it. Use it whenever you link to a file, e.g. as a webmention source. */
+  /**
+   * The public URL of `path`, as readers see it. Use it whenever you link to a file, e.g. as a webmention source.
+   * @throws {PupsError} `invalid_path` for a private file, which has no public URL.
+   */
   publicUrl(path: string): string {
     return publicUrl(this.server, this.resolve(path))
   }
@@ -170,19 +208,32 @@ export class PupsSession {
   /**
    * Reads a file from `storage_base`. By default this is a fresh read (RFC-6 "Fresh reads"): it carries the access
    * token, so that no cache between the app and the server can answer with an old version, and it returns the
-   * latest write. The token grants nothing else; every stored file is public. Use the ETag of the result for
-   * `replace()`; ETags from `public_base` may come from a CDN.
+   * latest write. For public files the token grants nothing else. Use the ETag of the result for `replace()`; ETags
+   * from `public_base` may come from a CDN.
+   *
+   * Private files (RFC-6 "Private areas"), in the app's private folder `private/` or in `/pups/private/`, are read
+   * the same way, and need a `write:` or `read:` scope that covers them.
    *
    * With `fresh: false` the request carries no token. It may then be answered from a cache, but works without a
-   * valid session.
+   * valid session. Private files can't be read this way.
    * @returns undefined if the file doesn't exist.
-   * @throws {PupsError} `session_expired` for a fresh read if the session can't be renewed.
+   * @throws {PupsError} `session_expired` for a fresh read if the session can't be renewed; `insufficient_scope` for a
+   *   private file outside the granted scopes; `invalid_request` for a private file with `fresh: false`.
    */
   async get(path: string, options: { signal?: AbortSignal; fresh?: boolean } = {}): Promise<StoredFile | undefined> {
     const absolute = this.resolve(path)
     validatePath(absolute, this.server.wellKnownPaths)
+    const fresh = options.fresh ?? true
+    if (isPrivate(absolute)) {
+      if (!fresh)
+        throw new PupsError('invalid_request', `${absolute} is private: it can only be read with the session's token, so fresh: false is not possible (RFC-6, Private areas).`)
+      if (!scopesAllowReading(this.scopes, absolute)) {
+        const granted = readScopePaths(this.scopes)
+        throw new PupsError('insufficient_scope', `${absolute} is private and outside the granted scopes (${granted.length ? granted.join(', ') : 'none that allow reading private files'}).`)
+      }
+    }
     const url = storageUrl(this.server, absolute)
-    const response = options.fresh ?? true
+    const response = fresh
       ? await this._authorized(url, {}, options.signal, readTimeoutMs)
       : await fetchWithTimeout(this.#ctx.fetch, url, { credentials: 'omit', cache: 'no-store' }, readTimeoutMs, options.signal)
     if (response.status == 404) return
@@ -361,7 +412,7 @@ export class PupsSession {
     return {
       path: absolute,
       etag: response.headers.get('ETag') ?? '',
-      url: publicUrl(this.server, absolute),
+      ...isPrivate(absolute) ? {} : { url: publicUrl(this.server, absolute) },
       created: response.status == 201,
     }
   }

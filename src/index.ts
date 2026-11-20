@@ -16,7 +16,7 @@ export type {
 } from './client.js'
 export { PupsSession } from './session.js'
 export type { Body, JsonBody, SessionChangeEvent, StoredFile, WriteOptions, WriteResult } from './session.js'
-export { FEED_REL, PUPS_FEED_SPEC, PupsFeed, feedScopes } from './feed.js'
+export { FEED_REL, PUPS_FEED_SPEC, PupsFeed, feedScopes, itemIndex } from './feed.js'
 export type {
   FeedAttachment,
   FeedAuthor,
@@ -28,6 +28,7 @@ export type {
   FeedSettingsChanges,
   FeedSetup,
   FeedState,
+  ItemMarker,
   MediaInput,
   MediaResult,
   PostChanges,

@@ -33,6 +33,16 @@ async function connect(options: MockOptions & { scopes?: Scope[]; grant?: string
   return { mock, client, store, session: session! }
 }
 
+function code(fn: () => unknown): PupsErrorCode | 'ok' {
+  try {
+    fn()
+    return 'ok'
+  } catch (e) {
+    if (isPupsError(e)) return e.code
+    throw e
+  }
+}
+
 async function errorCode(promise: Promise<unknown>): Promise<PupsErrorCode | 'ok'> {
   try {
     await promise
@@ -191,6 +201,81 @@ describe('files', () => {
     const posts = mock.state.requests.filter(r => r.url.startsWith('https://tim.example.com/pups/post'))
     expect(posts.map(r => new URL(r.url).searchParams.get('method'))).toEqual(['PUT', 'DELETE'])
     expect(new URL(posts[0]!.url).searchParams.get('path')).toBe('/appdata/app.example/a.json')
+  })
+})
+
+describe('private files', () => {
+  const reads = (mock: ReturnType<typeof createMockServer>, path: string) =>
+    mock.state.requests.filter(r => r.method == 'GET' && r.url.endsWith(path))
+
+  it("writes and reads the app's private folder with the appdata scope", async () => {
+    const { session, mock } = await connect()
+    expect(session.privatePath).toBe('/appdata/app.example/private/')
+    expect(session.isPrivate('private/settings.json')).toBe(true)
+    expect(session.isPrivate('settings.json')).toBe(false)
+    const written = await session.put('private/settings.json', { theme: 'dark' })
+    expect(written.path).toBe('/appdata/app.example/private/settings.json')
+    expect(written.url).toBeUndefined()
+    expect(await (await session.get('private/settings.json'))!.json()).toEqual({ theme: 'dark' })
+    await session.update('private/settings.json', async file => ({ ...await file!.json<object>(), lang: 'de' }))
+    expect(await (await session.get('private/settings.json'))!.json()).toEqual({ theme: 'dark', lang: 'de' })
+    expect(await session.get('private/missing.json')).toBeUndefined()
+    expect(session.canRead('private/settings.json')).toBe(true)
+    expect(code(() => session.publicUrl('private/settings.json'))).toBe('invalid_path')
+    expect(reads(mock, '/settings.json').length).toBe(3)
+  })
+
+  it('never reads a private file without the token', async () => {
+    const { session, mock } = await connect()
+    await session.put('private/a.json', '{}')
+    expect(await errorCode(session.get('private/a.json', { fresh: false }))).toBe('invalid_request')
+    expect(reads(mock, '/private/a.json')).toHaveLength(0)
+    // The server refuses it too, without telling whether it exists.
+    const response = await mock.fetch('https://tim.example.com/files/appdata/app.example/private/a.json')
+    expect(response.status).toBe(401)
+    expect(response.headers.get('Cache-Control')).toBe('no-store')
+  })
+
+  it('reads but never writes /pups/private/ with a read scope', async () => {
+    const { session, mock } = await connect({ scopes: ['identify', 'read:/pups/private/notes/'] })
+    mock.state.files.set('/pups/private/notes/todo.json', { body: new TextEncoder().encode('[]'), type: 'application/json', etag: '"t"' })
+    expect(session.hasScope('read:/pups/private/notes/')).toBe(true)
+    expect(session.hasScope('read:/pups/private/notes/todo.json')).toBe(true)
+    expect(session.hasScope('write:/pups/private/notes/')).toBe(false)
+    expect(session.canRead('/pups/private/notes/todo.json')).toBe(true)
+    expect(session.canWrite('/pups/private/notes/todo.json')).toBe(false)
+    expect((await session.get('/pups/private/notes/todo.json'))!.etag).toBe('"t"')
+    expect(await errorCode(session.put('/pups/private/notes/todo.json', '[1]'))).toBe('insufficient_scope')
+    expect(mock.state.requests.some(r => r.method == 'PUT')).toBe(false)
+  })
+
+  it('a write scope for /pups/private/ also reads', async () => {
+    const { session } = await connect({ scopes: ['write:/pups/private/notes/'] })
+    expect(session.hasScope('read:/pups/private/notes/')).toBe(true)
+    await session.create('/pups/private/notes/a.json', '{}')
+    expect((await session.get('/pups/private/notes/a.json'))!.etag).toBeTruthy()
+  })
+
+  it("refuses private files outside the granted scopes before sending, and the server does too", async () => {
+    const { session, mock } = await connect()
+    mock.state.files.set('/appdata/other.example/private/a.json', { body: new Uint8Array(), type: 'application/json', etag: '"o"' })
+    expect(session.canRead('/appdata/other.example/private/a.json')).toBe(false)
+    expect(session.canRead('/appdata/other.example/public.json')).toBe(true)
+    expect(await errorCode(session.get('/appdata/other.example/private/a.json'))).toBe('insufficient_scope')
+    expect(await errorCode(session.get('/pups/private/notes/a.json'))).toBe('insufficient_scope')
+    expect(reads(mock, '/a.json')).toHaveLength(0)
+    const token = await session._tokens.accessToken()
+    const response = await mock.fetch('https://tim.example.com/files/appdata/other.example/private/a.json', { headers: { Authorization: `Bearer ${token}` } })
+    expect(response.status).toBe(403)
+  })
+
+  it("can't link private files in host-meta.json", async () => {
+    const { session } = await connect()
+    await session.put('private/a.json', '{}')
+    expect(session.hostMeta.allowsRel('https://app.example/rel/index', 'private/a.json')).toBe(false)
+    expect(await errorCode(session.hostMeta.addLink({ rel: 'https://app.example/rel/index', href: 'private/a.json' }))).toBe('insufficient_scope')
+    expect(await errorCode(session.hostMeta.addLink({ rel: 'https://app.example/rel/index',
+      href: 'https://tim.example.com/files/appdata/app.example/private/a.json' }))).toBe('insufficient_scope')
   })
 })
 

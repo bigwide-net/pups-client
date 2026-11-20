@@ -39,7 +39,7 @@ Options:
                              or the URL of its client metadata document. Env: PUPS_CLIENT
   -d, --domain <domain>      Which signed-in domain to use. Default: the most recent. Env: PUPS_DOMAIN
   -s, --scope <scope>        login: scope to request, repeatable: appdata (default), identify,
-                             write:/<well-known path>
+                             write:/<well-known path>, read:/pups/private/<private path>
       --no-browser           login: print the URL instead of opening the browser
       --skip-check           login: don't check the client metadata document first
       --to <path>            put: target path, or directory ending in "/". Default: the file name
@@ -81,8 +81,8 @@ export function cliClientMetadata(clientId: string) {
 }
 
 const parseScope = (scope: string): Scope => {
-  if (scope == 'identify' || scope == 'appdata' || scope.startsWith('write:/')) return scope as Scope
-  throw new UsageError(`Unknown scope "${scope}". Use appdata, identify or write:/<path>.`)
+  if (scope == 'identify' || scope == 'appdata' || scope.startsWith('write:/') || scope.startsWith('read:/')) return scope as Scope
+  throw new UsageError(`Unknown scope "${scope}". Use appdata, identify, write:/<path> or read:/pups/private/<path>.`)
 }
 
 const out = (text: string) => process.stdout.write(text + '\n')
@@ -228,7 +228,7 @@ async function run(argv: string[]): Promise<number> {
           : await session.put(target, data, options)
         results.push(result)
         if (!opts.json) {
-          out(result.url)
+          out(result.url ?? `${result.path} (private, no public URL)`)
           info(`  ${result.created ? 'created' : 'replaced'} ${result.path} (ETag ${result.etag})`)
         }
       }

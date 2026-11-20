@@ -158,7 +158,7 @@ export class HostMetaEditor {
   }
 
   /**
-   * The path and public URL of a link target, which must be a file inside the granted scopes.
+   * The path and public URL of a link target, which must be a public file inside the granted scopes.
    * @throws {PupsError} `insufficient_scope`
    */
   #target(href: string): { path: string; url: string } {
@@ -166,6 +166,8 @@ export class HostMetaEditor {
     const path = /^[a-z][a-z0-9+.-]*:/i.test(href) ? pathFromPublicUrl(session.server, href) : session.resolve(href)
     if (!path || !session.canWrite(path))
       throw new PupsError('insufficient_scope', `"${href}" is not a file inside the scopes granted to this app. Links may only point to the app's own files (RFC-6, Links).`)
+    if (session.isPrivate(path))
+      throw new PupsError('insufficient_scope', `"${href}" is private: it has no public URL and can't be linked (RFC-6, Private areas).`)
     return { path, url: session.publicUrl(path) }
   }
 

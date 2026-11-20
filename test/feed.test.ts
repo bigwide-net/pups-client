@@ -445,3 +445,128 @@ describe('named feeds', () => {
     ])
   })
 })
+
+describe('indexes', () => {
+  const indexes = (doc: FeedDocument) => doc.items.map(item => item._pups?.index)
+  /** Removes all indexes and counters, as a feed written before RFC-7 had indexes. */
+  const unindex = (mock: Mock, path: string) => {
+    const { next_index: _next, ...marker } = read(mock, path)._pups ?? {}
+    const doc = read(mock, path)
+    writeRaw(mock, path, { ...doc, _pups: marker, items: doc.items.map(({ _pups: _, ...item }) => item) })
+  }
+
+  it('numbers the posts from 0, in the archives and the feed file, with the counter in the newest archive', async () => {
+    const { mock, session } = await connect()
+    const feed = session.feed()
+    await feed.create({ title: 'Notes' })
+    expect((await feed.addPost({ id: 'p1', content_text: '1' })).index).toBe(0)
+    await postMany(feed, 2, 25)
+    expect(indexes(read(mock, '/feed/feed.000000.json'))).toEqual(Array.from({ length: 20 }, (_, i) => 19 - i))
+    const newest = read(mock, '/feed/feed.000001.json')
+    expect(indexes(newest)).toEqual([24, 23, 22, 21, 20])
+    expect(newest._pups!.next_index).toBe(25)
+    const main = read(mock, '/feed.json')
+    expect(indexes(main)).toEqual(Array.from({ length: 25 }, (_, i) => 24 - i))
+    expect(main._pups).not.toHaveProperty('next_index')
+    expect((await feed.getPost('p7'))!.index).toBe(6)
+  })
+
+  it('never gives out an index again, and keeps it when the post is edited', async () => {
+    const { mock, session } = await connect()
+    const feed = session.feed()
+    await feed.create({ title: 'Notes' })
+    await postMany(feed, 1, 3)
+    await feed.deletePost('p3')
+    expect((await feed.addPost({ id: 'p4', content_text: '4' })).index).toBe(3)
+    await feed.editPost('p2', { title: 'Two', _pups: null } as never)
+    await feed.editPost('p4', item => ({ id: item.id, content_text: 'replaced' }))
+    expect(indexes(read(mock, '/feed/feed.000000.json'))).toEqual([3, 1, 0])
+    expect(indexes(read(mock, '/feed.json'))).toEqual([3, 1, 0])
+  })
+
+  it('ignores an index in the input', async () => {
+    const { session } = await connect()
+    const feed = session.feed()
+    await feed.create({ title: 'Notes' })
+    const result = await feed.addPost({ content_text: 'x', _pups: { index: 99, other: 1 } })
+    expect(result.item._pups).toEqual({ index: 0, other: 1 })
+  })
+
+  it('keeps the counter in the feed file of a feed without archives', async () => {
+    const { mock, session } = await connect()
+    const simple = session.feed(undefined, { startArchives: false, maxItems: 3 })
+    await simple.create({ title: 'Simple' })
+    await postMany(simple, 1, 5)
+    const main = read(mock, '/feed.json')
+    expect(indexes(main)).toEqual([4, 3, 2])
+    expect(main._pups!.next_index).toBe(5)
+  })
+
+  it('indexes a handed-over feed when it starts the archives', async () => {
+    const { mock, session } = await connect()
+    const old = range(25, 1).map(id => ({ id: `old-${id}`, content_text: id }))
+    writeRaw(mock, '/feed.json', { version: 'https://jsonfeed.org/version/1.1', title: 'Old', items: old, _pups: { pupsControlled: true } })
+    expect((await session.feed().addPost({ id: 'new', content_text: 'New' })).index).toBe(25)
+    expect(indexes(read(mock, '/feed/feed.000000.json'))).toEqual(Array.from({ length: 20 }, (_, i) => 19 - i))
+    expect(indexes(read(mock, '/feed/feed.000001.json'))).toEqual([25, 24, 23, 22, 21, 20])
+    expect(read(mock, '/feed/feed.000001.json')._pups!.next_index).toBe(26)
+    expect(indexes(read(mock, '/feed.json'))).toEqual(Array.from({ length: 26 }, (_, i) => 25 - i))
+  })
+
+  it('indexes an existing feed before posting to it: in the order of the archives, without gaps for deleted posts', async () => {
+    const { mock, session } = await connect()
+    const feed = session.feed()
+    await feed.create({ title: 'Notes' })
+    await postMany(feed, 1, 25)
+    await feed.deletePost('p2')
+    for (const path of ['/feed.json', '/feed/feed.000000.json', '/feed/feed.000001.json']) unindex(mock, path)
+
+    expect((await feed.addPost({ id: 'p26', content_text: '26' })).index).toBe(24)
+    expect(indexes(read(mock, '/feed/feed.000000.json'))).toEqual(Array.from({ length: 19 }, (_, i) => 18 - i))
+    expect(indexes(read(mock, '/feed/feed.000001.json'))).toEqual([24, 23, 22, 21, 20, 19])
+    expect(read(mock, '/feed/feed.000001.json')._pups!.next_index).toBe(25)
+    expect(indexes(read(mock, '/feed.json'))).toEqual(Array.from({ length: 25 }, (_, i) => 24 - i))
+  })
+
+  it('gives posts of clients without indexes theirs on the next post', async () => {
+    const { mock, session } = await connect()
+    const feed = session.feed()
+    await feed.create({ title: 'Notes' })
+    await postMany(feed, 1, 2)
+    // Another client, which doesn't know indexes, added two posts.
+    const archive = read(mock, '/feed/feed.000000.json')
+    writeRaw(mock, '/feed/feed.000000.json', { ...archive, items: [{ id: 'b', content_text: 'b' }, { id: 'a', content_text: 'a' }, ...archive.items] })
+    expect((await feed.addPost({ id: 'p3', content_text: '3' })).index).toBe(4)
+    expect(ids(read(mock, '/feed/feed.000000.json'))).toEqual(['p3', 'b', 'a', 'p2', 'p1'])
+    expect(indexes(read(mock, '/feed/feed.000000.json'))).toEqual([4, 3, 2, 1, 0])
+    expect(indexes(read(mock, '/feed.json'))).toEqual([4, 3, 2, 1, 0])
+  })
+
+  it('indexes a feed without posting', async () => {
+    const { mock, session } = await connect()
+    const feed = session.feed(undefined, { archiveSize: 2 })
+    await feed.create({ title: 'Notes' })
+    await postMany(feed, 1, 5)
+    for (const path of ['/feed.json', '/feed/feed.000000.json', '/feed/feed.000001.json', '/feed/feed.000002.json']) unindex(mock, path)
+    await feed.assignIndexes()
+    expect(indexes(read(mock, '/feed/feed.000002.json'))).toEqual([4])
+    expect(read(mock, '/feed/feed.000002.json')._pups!.next_index).toBe(5)
+    expect(indexes(read(mock, '/feed/feed.000000.json'))).toEqual([1, 0])
+    expect(indexes(read(mock, '/feed.json'))).toEqual([4, 3, 2, 1, 0])
+    const etag = mock.state.files.get('/feed.json')!.etag
+    await feed.assignIndexes()
+    expect(mock.state.files.get('/feed.json')!.etag).toBe(etag)
+  })
+
+  it('gives every post a different index when two clients post at the same time', async () => {
+    const { mock, session } = await connect()
+    await session.feed().create({ title: 'Notes' })
+    const a = session.feed(undefined, { maxAttempts: 50 })
+    const b = session.feed(undefined, { maxAttempts: 50 })
+    await Promise.all([postMany(a, 1, 15), (async () => {
+      for (let i = 16; i <= 30; i++) await b.addPost({ id: `p${i}`, content_text: `Post ${i}` })
+    })()])
+    const archived = [0, 1].flatMap(n => indexes(read(mock, `/feed/feed.00000${n}.json`)))
+    expect([...archived].sort((x, y) => x! - y!)).toEqual(Array.from({ length: 30 }, (_, i) => i))
+  })
+})

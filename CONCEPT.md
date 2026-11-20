@@ -132,8 +132,8 @@ await session.logout()   // forgets the credentials locally and revokes the gran
 | --- | --- | --- |
 | `discovery.ts` | Normalize the domain, fetch `host-meta.json` and the configuration document, validate them | Discovery |
 | `oauth.ts` | PKCE, authorization URL, callback parsing, code exchange, refresh, revocation, `iss` and `me` checks | Authorization, Tokens, Sign-in with your domain |
-| `scopes.ts` | Scope shorthands, validation against the configuration, `canWrite()` | Scopes |
-| `paths.ts` | Path resolution and the client-side mirror of the path rules, public URLs | Paths, Public URLs |
+| `scopes.ts` | Scope shorthands, validation against the configuration, `canWrite()`, `canRead()` | Scopes, Private areas |
+| `paths.ts` | Path resolution and the client-side mirror of the path rules, private paths, public URLs | Paths, Private areas, Public URLs |
 | `file-types.ts` | Extension allowlist, `Content-Type` inference and validation | File types |
 | `session.ts` | Requests to `storage_base` or `post_endpoint`, ETags, error mapping | Upload API, POST fallback |
 | `host-meta.ts` | Requests to `host_meta_endpoint` | Editing host-meta.json |
@@ -239,12 +239,13 @@ interface PupsServer {
 ### Scopes
 
 ```ts
-type Scope = 'identify' | 'appdata' | `write:/${string}`
+type Scope = 'identify' | 'appdata' | `write:/${string}` | `read:/${string}`
 ```
 
 - `'identify'` is passed through. With it alone, the session can't write, and the server may issue no refresh token.
-- `'appdata'` is a shorthand for `write:/appdata/<client-host>/`, computed from `clientId`. Apps should not spell out their own directory.
-- `write:/…` must be a well-known path declared in the server's `wellKnownPaths`, or a directory or file under a declared directory.
+- `'appdata'` is a shorthand for `write:/appdata/<client-host>/`, computed from `clientId`. Apps should not spell out their own directory. It includes the app's private folder `private/`.
+- `write:/…` must be a well-known path declared in the server's `wellKnownPaths`, or a directory or file under a declared directory. In `/pups/private/` it allows reading as well.
+- `read:/…` exists only for declared paths in `/pups/private/` (see [Private files](#private-files)). Public files need no read scope.
 
 `login()` checks every scope against the server before redirecting and throws `invalid_scope` for anything the server would reject. That turns a confusing OAuth error after a round trip into an immediate, explained error. Apps that want to offer a feature only if the server supports it check first:
 
@@ -253,7 +254,7 @@ const server = await pups.discover(domain)
 const canEditProfile = server.wellKnownPaths.some(p => p.path == '/.well-known/about.md')
 ```
 
-**The owner may drop scopes.** `session.scopes` holds the granted scopes, which may be fewer than requested. Apps check with `session.canWrite(path)` or `session.hasScope(scope)` and degrade gracefully. Dropping every scope is a denial and throws `access_denied`.
+**The owner may drop scopes.** `session.scopes` holds the granted scopes, which may be fewer than requested. Apps check with `session.canWrite(path)`, `session.canRead(path)` or `session.hasScope(scope)` and degrade gracefully. `hasScope('read:/…')` is also true when a `write:` scope covers the path. Dropping every scope is a denial and throws `access_denied`.
 
 ### `PupsSession`
 
@@ -264,12 +265,15 @@ interface PupsSession {
   readonly scopes: readonly string[]  // granted, not requested
   readonly server: PupsServer
   readonly appDataPath: string     // '/appdata/app.example/'
+  readonly privatePath: string     // '/appdata/app.example/private/'
   readonly persistent: boolean
 
   hasScope(scope: Scope): boolean
   canWrite(path: string): boolean
+  canRead(path: string): boolean   // public files always; private files if a write: or read: scope covers them
+  isPrivate(path: string): boolean
   resolve(path: string): string    // 'a/b.json' → '/appdata/app.example/a/b.json'; '/x' stays '/x'
-  publicUrl(path: string): string  // the URL readers use, e.g. for an RFC-4 webmention source
+  publicUrl(path: string): string  // the URL readers use, e.g. for an RFC-4 webmention source; throws for private files
   storageUrl(path: string): string
 
   get(path: string, options?: { signal?: AbortSignal; fresh?: boolean }): Promise<StoredFile | undefined>
@@ -295,7 +299,7 @@ interface WriteOptions {
 interface WriteResult {
   path: string                     // normalized absolute path
   etag: string
-  url: string                      // public URL
+  url?: string                     // public URL; absent for private files
   created: boolean                 // 201 vs 200
 }
 
@@ -329,7 +333,25 @@ interface StoredFile {
 
 **Content types.** The extension decides the type, as in the RFC. Without `contentType`, the library sends the served type from the extension table (`.json` → `application/json`). With `contentType`, it must be one of the accepted types for the extension (e.g. `application/feed+json` for `.json`), or the call fails with `unsupported_type` before any request. A blocked extension anywhere in the name (`feed.php.json`) fails the same way.
 
-**Reads.** `get()` reads from `storage_base`, because only ETags from `storage_base` are valid for conditions. By default it is a **fresh read** (RFC-6 "Fresh reads"): it carries the access token, so that no CDN or caching proxy between the app and the server can answer with an old version, and the server returns the latest write with `Cache-Control: private, no-store`. Without it, a cache that kept an old version would make the user miss their own changes, and `update()` would fail with `412` on every attempt, because it would read the same old ETag each time. The token grants nothing else, since every stored file is public; any valid token works, `identify` included. `get(path, { fresh: false })` sends no token: it may be answered from a cache, but works without a valid session. `get()` returns `undefined` on `404`.
+**Reads.** `get()` reads from `storage_base`, because only ETags from `storage_base` are valid for conditions. By default it is a **fresh read** (RFC-6 "Fresh reads"): it carries the access token, so that no CDN or caching proxy between the app and the server can answer with an old version, and the server returns the latest write with `Cache-Control: private, no-store`. Without it, a cache that kept an old version would make the user miss their own changes, and `update()` would fail with `412` on every attempt, because it would read the same old ETag each time. For public files the token grants nothing else; any valid token works, `identify` included. `get(path, { fresh: false })` sends no token: it may be answered from a cache, but works without a valid session. `get()` returns `undefined` on `404`.
+
+### Private files
+
+RFC-6 has two private areas, whose files only the owner's apps can read:
+
+| Area | Scope | Example |
+| --- | --- | --- |
+| The app's private folder, `/appdata/<client-host>/private/` | `'appdata'` | `session.put('private/settings.json', …)` |
+| `/pups/private/`, private files that extensions of RFC-6 define and several apps share | `read:/pups/private/…` to read, `write:/pups/private/…` to read and write; the path must be declared in `wellKnownPaths` | `session.get('/pups/private/inbox.json')` |
+
+The file API is the same as for public files; the library adds what the RFC requires of private paths:
+
+- `get()` of a private file is always a fresh read. `fresh: false` throws `invalid_request` before any request, since the server answers `401` without a token.
+- A private file outside the granted scopes throws `insufficient_scope` before any request, for `get()` as for writes. A `read:` scope never allows writing.
+- Private files have no public URL: `publicUrl()` throws `invalid_path`, `WriteResult.url` is absent, `pathFromPublicUrl()` ignores URLs that would map to one, and `hostMeta` refuses to link them (`insufficient_scope`).
+- `isPrivate(path)` uses the RFC's rule, case-insensitively like the servers: `/pups/private/…` and `/appdata/<host>/private/…`.
+
+Private means hidden from the public, not encrypted: whoever runs the server can read the files. Apps that store data the host must not see encrypt it before uploading it.
 
 ### `HostMetaEditor`
 
@@ -371,7 +393,8 @@ interface PupsFeed {
   setFavicon(media: MediaInput | null): Promise<FeedDocument>
   uploadMedia(media: MediaInput, options?: { folder?: string }): Promise<MediaResult>
 
-  addPost(post: PostInput): Promise<PostResult>   // url: the post's archive URL + '#id'
+  addPost(post: PostInput): Promise<PostResult>   // url: the post's archive URL + '#id'; index: _pups.index
+  assignIndexes(): Promise<void>                  // index a feed written before RFC-7 had indexes
   getPost(id: string): Promise<PostResult | undefined>
   posts(): AsyncGenerator<FeedItem>
   editPost(id: string, changes: PostChanges | ((item: FeedItem) => FeedItem | undefined)): Promise<PostResult>
@@ -384,6 +407,7 @@ interface PupsFeed {
 - **Layout.** Named feeds share `/feed/` with the main feed, so the main feed's media go only into `/feed/images/` and `/feed/media/`, the names `images` and `media` can't be feed names, and `deletePost(…, { deleteMedia: true })` on the main feed never touches files of named feeds.
 - **Posting.** `addPost()` adds the post to the newest archive (the one `_pups.archive_url` names), or creates a new archive linked to it once the newest holds `archiveSize` (20) posts, and then inserts it at the top of the feed file, which keeps the newest `maxItems` (30), fewer with `maxBytes`. The archive is written first; the feed file always takes all posts of the newest archive, which repairs interrupted posts. Every step is repeated on `412`, up to `maxAttempts` (8). A feed without `archive_url` (new, written by simple clients, or handed over) gets its existing items archived first, oldest first, with its old `next_url` at the end of the chain, unless `startArchives` is false: then posts only go into the feed file, as RFC-7 allows for clients without archive support.
 - **Post URLs.** `PostResult.url` is the post's archive URL plus `#<id>`. Posts never leave their archive, so it never changes; an RFC-4 webmention uses it as `source`.
+- **Indexes** (RFC-7 "Indexes"). Every post gets `_pups.index` from the counter `_pups.next_index` of the newest archive (of the feed file, without archives), in the same ETag-protected write that adds it; a new archive takes the counter over. Indexes never change and are never reused, so deleted posts leave gaps. Before writing the counter's file, posts without an index (from apps that don't know indexes) get the next ones, oldest first. A newest archive without a counter means the feed hasn't been indexed: `addPost()` then reads all PUPS archives, numbers the unindexed posts in archive order above the highest index found, writes the changed archives oldest first (the newest last, with the counter) and the feed file's copies, and starts the post again. `assignIndexes()` does the same without posting.
 - **Editing and deleting** find the post in the archives, from `_pups.archive_url` along `next_url`, change its archive, and then the feed file if the post is there. After a delete, the feed file is filled up again from the archives. `deletePost(id, { deleteMedia: true })` reads all archives to find media no other post references.
 - **Ids** are 16 random URL-safe characters unless given; `date_published` defaults to now; `markdown` goes into `_source.markdown` (RFC-1), with `content_text` as the fallback JSON Feed requires.
 

@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest'
 import { normalizeDomain, parseConfig } from '../src/discovery.js'
 import { isPupsError } from '../src/errors.js'
 import { fileTypeOf, uploadContentType } from '../src/file-types.js'
-import { pathFromPublicUrl, publicUrl, validatePath } from '../src/paths.js'
+import { isPrivate, pathFromPublicUrl, publicUrl, validatePath } from '../src/paths.js'
 import { expandScopes, validateScopes } from '../src/scopes.js'
 import { createMockServer } from './mock-server.js'
 
@@ -89,8 +89,34 @@ describe('scopes', () => {
     [['write:/'], 'invalid_scope'],
     [['write:/.well-known/host-meta.json'], 'invalid_scope'],
     [['read:/x'], 'invalid_scope'],
+    [['read:/pups/private/notes/'], 'ok'],
+    [['read:/pups/private/notes/todo.json'], 'ok'],
+    [['write:/pups/private/notes/'], 'ok'],
+    [['read:/pups/private/other/'], 'invalid_scope'],
+    [['read:/pups/private/'], 'invalid_scope'],
+    [['read:/feed/'], 'invalid_scope'],
+    [['read:/appdata/app.example/'], 'invalid_scope'],
+    [['read:/appdata/app.example/private/'], 'invalid_scope'],
     [[], 'invalid_scope'],
   ])('%j → %s', (scopes, expected) => expect(code(() => validateScopes(scopes, server, clientId))).toBe(expected))
+})
+
+describe('private areas', () => {
+  it.each([
+    ['/pups/private/notes/a.json', true],
+    ['/appdata/app.example/private/a.json', true],
+    ['/APPDATA/app.example/Private/a.json', true],
+    ['/appdata/app.example/private', false],
+    ['/appdata/app.example/privates/a.json', false],
+    ['/appdata/app.example/x/private/a.json', false],
+    ['/pups/pages/private/a.md', false],
+  ])('%s → %s', (path, expected) => expect(isPrivate(path)).toBe(expected))
+
+  it('private files have no public URL', () => {
+    expect(code(() => publicUrl(server, '/appdata/app.example/private/a.json'))).toBe('invalid_path')
+    expect(pathFromPublicUrl(server, 'https://tim.example.com/files/appdata/app.example/private/a.json')).toBeUndefined()
+    expect(pathFromPublicUrl(server, 'https://tim.example.com/files/pups/private/notes/a.json')).toBeUndefined()
+  })
 })
 
 describe('public URLs', () => {
