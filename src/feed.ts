@@ -8,6 +8,12 @@ import { randomString } from './util.js'
 /** The link relation that registers a feed in `host-meta.json` (RFC-7). A placeholder in RFC-7. */
 export const FEED_REL = 'https://bigwide.net/ns/feed'
 
+/**
+ * The site property in `host-meta.json` with the URL template of the pages that show single posts, e.g.
+ * `https://tim.example/p/{feed}/post/{index}` (RFC-6 "Post URLs", RFC-7 "Post URLs").
+ */
+export const POST_URL_TEMPLATE = 'https://bigwide.net/ns/post-url-template'
+
 /** The `about` of the `_pups` object: RFC-7. Not its final location; readers must not rely on it. */
 export const PUPS_FEED_SPEC = 'https://github.com/bigwide-net/RFCs/blob/main/RFC-7-Feed-Publishing-with-PUPS.md'
 
@@ -222,6 +228,11 @@ export interface FeedOptions {
   maxBytes?: number
   /** How often an operation is repeated when another client changed the feed in between. Default 8. */
   maxAttempts?: number
+  /**
+   * Whether posts of a feed with archives get a `url` from the site's post URL template, if `host-meta.json`
+   * declares one and the post has no `url` (RFC-7 "Post URLs"). Default true.
+   */
+  postUrls?: boolean
 }
 
 /** A feed registered in `host-meta.json`. */
@@ -301,6 +312,16 @@ export function itemIndex(item: FeedItem): number | undefined {
 
 const withIndex = (item: FeedItem, index: number): FeedItem => ({ ...item, _pups: { ...isObject(item._pups) ? item._pups : {}, index } })
 
+/** A post URL template (RFC-6 "Post URLs"): an https URL with `{index}` or `{id}`. */
+function validTemplate(template: unknown): template is string {
+  if (typeof template != 'string' || !/\{(index|id)\}/.test(template)) return false
+  try {
+    return new URL(template.replace(/\{(feed|index|id)\}/g, 'x')).protocol == 'https:'
+  } catch {
+    return false
+  }
+}
+
 /** The counter `_pups.next_index` of a file, if it has a valid one. */
 function counterOf(doc: FeedDocument): number | undefined {
   const next = doc._pups?.next_index
@@ -364,6 +385,8 @@ export class PupsFeed {
   readonly #archivesWanted: boolean
   readonly #maxBytes?: number
   readonly #maxAttempts: number
+  readonly #postUrls: boolean
+  #template?: Promise<string | undefined>
 
   /** @internal Use `session.feed()`. */
   constructor(session: PupsSession, name?: string, options: FeedOptions = {}) {
@@ -377,6 +400,7 @@ export class PupsFeed {
     this.#archivesWanted = options.startArchives ?? true
     this.#maxBytes = options.maxBytes
     this.#maxAttempts = options.maxAttempts ?? 8
+    this.#postUrls = options.postUrls ?? true
     if (!(this.#archiveSize >= 1 && this.#maxItems >= 1))
       throw new PupsError('invalid_request', 'Feed options: maxItems and archiveSize must be at least 1.')
   }
@@ -522,8 +546,11 @@ export class PupsFeed {
    * holds `archiveSize` items, then to the top of the feed file, which keeps the newest `maxItems`. A feed without
    * archives gets them now, unless `startArchives` is false; then the post only goes into the feed file. Upload
    * media with `uploadMedia()` before posting.
+   * In a feed with archives, a post without `url` gets one from the site's post URL template, if `host-meta.json`
+   * has one and `postUrls` isn't false: the page that shows the post (RFC-7 "Post URLs").
    * @returns the post, with `url`: its archive's URL plus `#<id>`, which never changes; for a feed without
-   *   archives, the feed file's URL plus `#<id>`, valid while the post is among the newest.
+   *   archives, the feed file's URL plus `#<id>`, valid while the post is among the newest. The post's page, if it
+   *   has one, is `item.url`.
    */
   async addPost(input: PostInput, options: Signal = {}): Promise<PostResult> {
     const item = this.#newItem(input)
@@ -555,7 +582,8 @@ export class PupsFeed {
           doc.items = started.items
         }
       }
-      const added = await this.#addToArchive(main, doc, item, signal)
+      const template = await this.#postUrlTemplate(signal)
+      const added = await this.#addToArchive(main, doc, item, signal, template)
       archiveUrl = added.url
       stored = added.item
       doc._pups!.archive_url = added.url
@@ -625,7 +653,8 @@ export class PupsFeed {
    * a function that gets a copy of the item and returns the new item, or `undefined` to leave it unchanged. The
    * function may run more than once.
    *
-   * Apps should edit posts only when the owner asks them to, whichever app created them.
+   * Apps should edit posts only when the owner asks them to, whichever app created them. A post of a feed with
+   * archives that has no `url`, and had none before, gets one from the post URL template, as in `addPost()`.
    * @throws {PupsError} `not_found`
    */
   async editPost(id: string, changes: PostChanges | ((item: FeedItem) => FeedItem | undefined | Promise<FeedItem | undefined>), options: Signal = {}): Promise<PostResult> {
@@ -640,6 +669,9 @@ export class PupsFeed {
       let item: FeedItem = { ...changed, id, date_modified: now() }
       // The index never changes (RFC-7 "Indexes").
       if (oldIndex !== undefined) item = withIndex(item, oldIndex)
+      // A post of a feed with archives that never had a url may get one (RFC-7 "Post URLs").
+      if (oldIndex !== undefined && !old.url && !item.url && this.#archiveNumber(main.doc._pups?.archive_url) !== undefined)
+        item = this.#withPostUrl(item, oldIndex, await this.#postUrlTemplate(signal))
       if (file != main) await this.#writeArchive(file, replaceAt(file.doc.items, index, item), signal)
       const mainIndex = main.doc.items.findIndex(i => i.id == id)
       if (mainIndex >= 0) await this.#writeMain({ ...main.doc, items: replaceAt(main.doc.items, mainIndex, item) }, main.etag, signal)
@@ -940,7 +972,8 @@ export class PupsFeed {
    * indexed first, and the post then starts again.
    * @returns the archive's URL, the newest items known from the archives, newest first, and the item as stored.
    */
-  async #addToArchive(main: Loaded, doc: FeedDocument, item: FeedItem, signal?: AbortSignal): Promise<{ url: string; recent: FeedItem[]; item: FeedItem }> {
+  async #addToArchive(main: Loaded, doc: FeedDocument, item: FeedItem, signal?: AbortSignal, template?: string): Promise<{ url: string; recent: FeedItem[]; item: FeedItem }> {
+    const place = (index: number) => this.#withPostUrl(withIndex(item, index), index, template)
     const newest = this.#archiveNumber(doc._pups?.archive_url)
     let previous: FeedItem[] = []
     // The index for the item if it goes into a new archive.
@@ -951,7 +984,7 @@ export class PupsFeed {
         // The owner deleted it: create it again, linked to the next older archive, with an index above all known ones.
         const before = newest ? await this.#readArchive(this.#archivePath(newest - 1), signal) : undefined
         if (before && before != 'foreign') next = nextFree([...doc.items, ...before.doc.items], counterOf(before.doc))
-        const stored = withIndex(item, next)
+        const stored = place(next)
         await this.#createArchive(newest, doc, [stored], newest ? this.#archiveUrl(newest - 1) : undefined, signal, next + 1)
         return { url: this.#archiveUrl(newest), recent: [stored], item: stored }
       }
@@ -963,7 +996,7 @@ export class PupsFeed {
         // Items that a client without indexes added get theirs first (RFC-7 "Items without an index").
         const indexed = indexItems(existing.doc.items, nextFree(existing.doc.items, counterOf(existing.doc)))
         const copy = indexed.items.find(i => i.id == item.id)
-        const stored = withIndex(item, copy ? itemIndex(copy)! : indexed.next)
+        const stored = place(copy ? itemIndex(copy)! : indexed.next)
         const merged = mergeItems(indexed.items, [stored])
         if (merged.length <= this.#archiveSize) {
           await this.#writeArchive(existing, merged, signal, copy ? indexed.next : indexed.next + 1)
@@ -977,7 +1010,7 @@ export class PupsFeed {
     // The archive before the new one: the newest, or for a feed without archives the end of its old chain.
     const nextUrl = newest === undefined ? doc.next_url : this.#archiveUrl(newest)
     for (let n = newest === undefined ? 0 : newest + 1; n <= maxArchiveNumber; n++) {
-      const stored = withIndex(item, next)
+      const stored = place(next)
       try {
         await this.#createArchive(n, doc, [stored], nextUrl, signal, next + 1)
         return { url: this.#archiveUrl(n), recent: [stored, ...previous], item: stored }
@@ -989,7 +1022,7 @@ export class PupsFeed {
       if (existing && existing != 'foreign' && existing.doc.next_url == nextUrl) {
         const indexed = indexItems(existing.doc.items, nextFree(existing.doc.items, counterOf(existing.doc), next))
         const copy = indexed.items.find(i => i.id == item.id)
-        const added = withIndex(item, copy ? itemIndex(copy)! : indexed.next)
+        const added = place(copy ? itemIndex(copy)! : indexed.next)
         const merged = mergeItems(indexed.items, [added])
         if (merged.length <= this.#archiveSize) {
           await this.#writeArchive(existing, merged, signal, copy ? indexed.next : indexed.next + 1)
@@ -1003,6 +1036,22 @@ export class PupsFeed {
   }
 
   // Items and media
+
+  /** The site's post URL template from `host-meta.json`, read once; undefined if there is none or it can't be read. */
+  #postUrlTemplate(signal?: AbortSignal): Promise<string | undefined> {
+    if (!this.#postUrls) return Promise.resolve(undefined)
+    this.#template ??= this.#session.hostMeta.get({ signal })
+      .then(doc => doc.properties?.[POST_URL_TEMPLATE])
+      .then(template => validTemplate(template) ? template : undefined, () => undefined)
+    return this.#template
+  }
+
+  /** The item with the `url` from the post URL template (RFC-7 "Post URLs"), unless it has one. */
+  #withPostUrl(item: FeedItem, index: number, template?: string): FeedItem {
+    if (!template || item.url) return item
+    const vars: Record<string, string> = { feed: this.path.slice(1, -'.json'.length), index: String(index), id: encodeURIComponent(item.id) }
+    return { ...item, url: template.replace(/\{(feed|index|id)\}/g, (_, name: string) => vars[name]!) }
+  }
 
   #newItem(input: PostInput): FeedItem {
     const { id, markdown, date_published, ...fields } = input

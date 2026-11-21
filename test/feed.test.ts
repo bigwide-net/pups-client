@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it } from 'vitest'
 import { PupsClient } from '../src/client.js'
 import { isPupsError, type PupsErrorCode } from '../src/errors.js'
-import { FEED_REL, feedScopes, type FeedDocument, type PupsFeed } from '../src/feed.js'
+import { FEED_REL, feedScopes, POST_URL_TEMPLATE, type FeedDocument, type PupsFeed } from '../src/feed.js'
 import type { Scope } from '../src/scopes.js'
 import { MemoryTokenStore } from '../src/store/memory-store.js'
 import { createMockServer } from './mock-server.js'
@@ -568,5 +568,69 @@ describe('indexes', () => {
     })()])
     const archived = [0, 1].flatMap(n => indexes(read(mock, `/feed/feed.00000${n}.json`)))
     expect([...archived].sort((x, y) => x! - y!)).toEqual(Array.from({ length: 30 }, (_, i) => i))
+  })
+})
+
+describe('post URLs', () => {
+  const template = `${origin}/p/{feed}/post/{index}`
+  const withTemplate = async (value: string = template) => {
+    const c = await connect()
+    c.mock.state.hostMeta.properties[POST_URL_TEMPLATE] = value
+    return c
+  }
+
+  it('gives posts of a feed with archives the URL of their page, in the archive and the feed file', async () => {
+    const { mock, session } = await withTemplate()
+    const feed = session.feed()
+    await feed.create({ title: 'Notes' })
+    const hostMetaReads = () => mock.state.requests.filter(r => r.url.endsWith('/.well-known/host-meta.json')).length
+    const before = hostMetaReads()
+    const post = await feed.addPost({ id: 'p0', content_text: '0' })
+    expect(post.item.url).toBe(`${origin}/p/feed/post/0`)
+    expect(post.url).toBe(`${origin}/feed/feed.000000.json#p0`)
+    await postMany(feed, 1, 21)
+    expect(read(mock, '/feed/feed.000001.json').items[0]!.url).toBe(`${origin}/p/feed/post/21`)
+    expect(read(mock, '/feed.json').items.map(item => item.url)).toEqual(Array.from({ length: 22 }, (_, i) => `${origin}/p/feed/post/${21 - i}`))
+    expect(hostMetaReads() - before).toBe(1) // the template is read once
+  })
+
+  it('fills {feed} with the feed file’s path, and {id}', async () => {
+    const { session } = await withTemplate(`${origin}/posts/{feed}/{id}.html`)
+    const feed = session.feed('photos')
+    await feed.create({ title: 'Photos' })
+    expect((await feed.addPost({ id: 'a b', content_text: 'x' })).item.url).toBe(`${origin}/posts/feed/photos/a%20b.html`)
+  })
+
+  it('keeps the url the app gives, and adds none without archives, template or wish', async () => {
+    const { mock, session } = await withTemplate()
+    const feed = session.feed()
+    await feed.create({ title: 'Notes' })
+    expect((await feed.addPost({ content_text: 'x', url: 'https://elsewhere.example/1' })).item.url).toBe('https://elsewhere.example/1')
+    expect((await session.feed(undefined, { postUrls: false }).addPost({ content_text: 'x' })).item.url).toBeUndefined()
+
+    const plain = session.feed('photos', { startArchives: false })
+    await plain.create({ title: 'Photos' })
+    expect((await plain.addPost({ content_text: 'x' })).item.url).toBeUndefined()
+
+    for (const bad of ['http://tim.example.com/p/{index}', `${origin}/p/latest`, 'javascript:{index}']) {
+      mock.state.hostMeta.properties[POST_URL_TEMPLATE] = bad
+      expect((await session.feed().addPost({ content_text: 'x' })).item.url).toBeUndefined()
+    }
+    delete mock.state.hostMeta.properties[POST_URL_TEMPLATE]
+    expect((await session.feed().addPost({ content_text: 'x' })).item.url).toBeUndefined()
+  })
+
+  it('adds the url when a post without one is edited, but never changes or restores one', async () => {
+    const { mock, session } = await connect()
+    const feed = session.feed()
+    await feed.create({ title: 'Notes' })
+    await feed.addPost({ id: 'old', content_text: 'x' })
+    await feed.addPost({ id: 'own', content_text: 'x', url: 'https://elsewhere.example/1' })
+    mock.state.hostMeta.properties[POST_URL_TEMPLATE] = template
+    const edited = session.feed()
+    expect((await edited.editPost('old', { title: 'Old' })).item.url).toBe(`${origin}/p/feed/post/0`)
+    expect(read(mock, '/feed.json').items.find(item => item.id == 'old')!.url).toBe(`${origin}/p/feed/post/0`)
+    expect((await edited.editPost('own', { title: 'Own' })).item.url).toBe('https://elsewhere.example/1')
+    expect((await edited.editPost('own', { url: null })).item.url).toBeUndefined()
   })
 })

@@ -141,6 +141,7 @@ else if (state.status == 'foreign')
 const photo = await feed.uploadMedia(photoFile)                   // → https://…/feed/images/2026/….jpg
 const post = await feed.addPost({ title: 'Hello', content_html: `<p>Hi!</p><img src="${photo.url}" alt="">` })
 await feed.addPost({ markdown: 'Written in *Markdown*' })         // _source.markdown, with content_text as fallback
+console.log(post.item.url)                                        // the post's page on the homepage, if the site declares one
 await feed.editPost(post.id, { title: 'Hello, world' })           // wherever the post is now, sets date_modified
 await feed.deletePost(post.id, { deleteMedia: true })             // also deletes media no other post uses
 await feed.updateSettings({ description: 'Longer notes', _podcast: { explicit: false } })
@@ -151,7 +152,7 @@ const feeds = await session.listFeeds()                           // the feeds r
 
 - **Archives.** Every post goes into the newest archive, `feed.000000.json`, `feed.000001.json`, … in the feed directory, 20 posts each, linked with `next_url`; posts never move. The feed file holds a copy of the newest 30 posts and points to the newest archive with `_pups.archive_url`; archives point back with `_pups.updates_url`. `session.feed(name, { maxItems, archiveSize, maxBytes })` changes the sizes. Archives are optional in RFC-7: with `{ startArchives: false }`, a feed without archives stays a plain feed file with the newest posts; a feed that has archives always keeps them.
 - **Concurrency.** Every change is a read-modify-write with ETags, repeated when another app or the owner wrote in between. The archive is always written before the feed file, so no post is ever lost, and the next post repairs a feed file that an interrupted post didn't reach.
-- **Post URLs.** `addPost()` returns `url`, the post's archive URL plus `#<id>`. It never changes, so it can be the `source` of an RFC-4 webmention.
+- **Post URLs.** `addPost()` returns `url`, the post's archive URL plus `#<id>`. It never changes, so it can be the `source` of an RFC-4 webmention. If the site has a homepage that shows single posts, such as webpup, `host-meta.json` declares their URLs with the property `https://bigwide.net/ns/post-url-template` (`POST_URL_TEMPLATE`), e.g. `https://tim.example/p/{feed}/post/{index}`. Posts of a feed with archives then get the URL of their page as `url`, unless the app sets one; `editPost()` adds it to older posts that have none. Show `post.item.url` as the post's link; `session.feed(name, { postUrls: false })` turns this off.
 - **Indexes.** Every post gets an index, `_pups.index` (also `PostResult.index`, or `itemIndex(item)`): 0 for the first post, then counting up, never changed and never given out again, with the counter `_pups.next_index` in the newest archive. Readers can number the posts and load only the archives they need. A feed written before indexes existed is indexed on its next post, or with `feed.assignIndexes()`; posts of apps that don't know indexes get theirs on the next post.
 - Errors: `not_pups_controlled` for feeds without the marker, `invalid_feed` for files that aren't JSON Feeds, `not_found` for a missing feed or post.
 
