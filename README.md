@@ -161,16 +161,15 @@ const feeds = await session.listFeeds()                           // the feeds r
 
 ### Mentions and submissions
 
-A feed can tell the people a post names or answers ([RFC-11](https://github.com/bigwide-net/RFCs/blob/main/RFC-11-Mentions.md)), and submit comments to other feeds ([RFC-4](https://github.com/bigwide-net/RFCs/blob/main/RFC-4-Feed-Submissions.md)):
+A feed can tell the people a post names or answers ([RFC-11](https://github.com/bigwide-net/RFCs/blob/main/RFC-11-Mentions.md)), and the owner can comment on other feeds ([RFC-4](https://github.com/bigwide-net/RFCs/blob/main/RFC-4-Feed-Submissions.md)):
 
 ```ts
 const feed = session.feed(undefined, { mentions: true })
 const post = await feed.addPost({ content_html: '<p>Great talk by <a href="https://alice.example/">@alice.example</a></p>' })
 for (const r of await post.mentions ?? []) console.log(r.account, r.status)   // @alice.example accepted
 
-const comment = await feed.addPost({ content_text: 'Agreed!', _source: { inReplyTo: 'https://rm.example/groups/g/posts.json#a8Kd03' } })
-const submission = await feed.submit(comment.id)                  // to the target feed's _submissions.url
-await session.mentions.submissionStatus(submission.statusUrl!)    // { status: 'success', pubUrl: … }
+const comment = await session.comments.post({ target: 'https://rm.example/groups/g/posts.json#a8Kd03', markdown: 'Agreed!' })
+await session.mentions.submissionStatus(comment.submission!.statusUrl!)   // { status: 'success', pubUrl: … }
 
 await session.mentions.notify(source, '@alice.example')           // the generic interface: any source, any account
 await session.mentions.reply(source, 'https://bob.example/feed.json#p-12')
@@ -188,7 +187,7 @@ await session.mentions.reply(source, 'https://bob.example/feed.json#p-12')
 - **Automatic mentions.** With `{ mentions: true }`, `addPost()`, `editPost()` and `deletePost()` find the handles in the post's title and visible text, e.g. `@alice.example`, also lists like `@alice.example/@bob.example`, but not e-mail addresses, fediverse addresses, names without a dot or paths. The author of the item a post answers (`_source.inReplyTo`) gets a reply mention. Each account is notified once, never the owner, at most 20 per post; after an edit or delete, everyone the old or the new version named.
 - **After the upload.** The mentions are sent in the background, once the post is visible at its public URL (so that a CDN doesn't hand the receiver an old copy), with the archive URL plus `#<id>` as `source`. `post.mentions` resolves to one report per account (`accepted`, `rejected`, `failed`, `unknown` or `no-endpoint`) and never rejects; a failed mention never fails the post. Network errors, `5xx` and `429` are retried a few times; `feed.sendMentions(id)` sends again later.
 - **Discovery.** The endpoint is the link `https://bigwide.net/ns/mention` in the domain's `host-meta.json`, cached for a day, failures for an hour. A domain without one, or whose `host-meta.json` doesn't allow CORS, gets nothing. An endpoint without CORS headers still receives the mention; its report says `unknown`.
-- **Replies to RFC-4 feeds** are submissions, not mentions: if the answered feed has `_submissions`, no mentions are sent (the RFC-4 server sends them once it republishes the comment). Submitting is never automatic, because the app must first show the target's terms of service and what `republish` means: call `feed.submit(id)` after `addPost()`, and again after `editPost()` or `deletePost()`.
+- **Comments** on other feeds, and posts to discussion groups, are RFC-4 submissions. They never go into the owner's main feed: `session.comments` keeps them in comment feeds in the app's own directory, one file per target site and hour, `/appdata/<client-host>/comments/<hash3>/<hash>.json`, as RFC-7 "Comment feeds" recommends, which needs the `appdata` scope. `post()` adds the comment to its file (creating it if needed) and submits it to the target once it is visible; `edit(source, changes)` and `delete(source)` change the file and submit again with the same `source`; `{ submit: false }` writes without submitting. Show the target's terms of service and what `republish` means before the first submission. No mentions are sent for comments: the RFC-4 server sends them once it republishes the comment. `feed.submit()` is deprecated.
 - `new Mentions({ fetch })` works without a session. `findHandles()`, `itemHandles()` and `visibleText()` are exported too.
 
 ### What the library does for you

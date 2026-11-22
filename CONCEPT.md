@@ -401,7 +401,7 @@ interface PupsFeed {
   planMentions(post?: MentionSource, options?: { previous?: MentionSource; discover?: boolean }): Promise<PlannedMention[]>
   sendMentions(id: string, options?: { previous?: FeedItem }): Promise<MentionReport[]>
   // addPost, editPost and deletePost take { mentions?: boolean | PlannedMention[] }: all, none, or the confirmed ones
-  submit(id: string): Promise<Submission>             // RFC-4, to the target's _submissions.url
+  submit(id: string): Promise<Submission>             // deprecated: comments use session.comments (RFC-7 "Comment feeds")
 
   addPost(post: PostInput): Promise<PostResult>   // url: the post's archive URL + '#id'; index: _archive.index
   assignIndexes(): Promise<void>                  // index a feed written before RFC-7 had indexes
@@ -447,7 +447,28 @@ class Mentions {
 - **Asking first.** `plan()` returns the accounts without sending anything (it reads only the feeds of answered items; with `discover`, also the `host-meta.json` of each domain, and drops those without an endpoint). The app shows them, and passes the confirmed list as the write's `mentions` option, `false` to post without mentions; `sendPlanned()` sends exactly that list once the post is visible.
 - **`plan()`** first reads the items the post and its previous version answer: if one is in a feed with `_submissions` (for an RFC-7 archive, those of its feed file), the post is an RFC-4 submission and nothing is sent. Otherwise the item's socialspec account (or the feed's, if the feed has no `_submissions`) gets a reply mention with the item as target, and every other named host a mention with its root URL as target. Never `me`, each host once, at most 20.
 - **Sending**: `POST` with `source` and `target`, form-encoded, without credentials. `2xx` is `accepted`, other `4xx` `rejected` (with `message` and `code` from a JSON body), network errors, `5xx` and `429` `failed` after the `retryDelays` (10 s, 1 min, 5 min; a longer `Retry-After` up to 10 minutes). A browser can't read the answer of an endpoint without CORS headers: the request is sent again in `no-cors` mode, which a simple request allows, and reported as `unknown`.
-- **Feeds** with the option `mentions` call `waitForItem()` on the post's public file (polling without cache until the item is there, changed or gone, about half a minute at most), then `notifyAll()`, in the background; `PostResult.mentions` holds the promise. `feed.sendMentions(id)` sends again; `feed.submit(id)` submits a post to the feed its `_source.inReplyTo` names.
+- **Feeds** with the option `mentions` call `waitForItem()` on the post's public file (polling without cache until the item is there, changed or gone, about half a minute at most), then `notifyAll()`, in the background; `PostResult.mentions` holds the promise. `feed.sendMentions(id)` sends again. `feed.submit(id)` is deprecated: comments don't belong in a feed for readers.
+
+### `PupsComments`
+
+`session.comments`: the owner's RFC-4 submissions (comments, and posts to discussion groups), in comment feeds in the app's own directory (RFC-7 "Comment feeds"). Needs the `appdata` scope.
+
+```ts
+class PupsComments {
+  post(input: CommentInput, options?: { submit?: boolean }): Promise<CommentResult>     // input.target: the answered item, or a group feed
+  get(source: string): Promise<CommentResult | undefined>
+  edit(source: string, changes: CommentChanges | ((item: FeedItem) => FeedItem), options?: { submit?: boolean }): Promise<CommentResult>
+  delete(source: string, options?: { submit?: boolean }): Promise<CommentResult>
+  submit(source: string, target: string, options?: { deleted?: boolean }): Promise<Submission>   // again, e.g. after a failure
+  pathFor(target: string, date: Date | string): Promise<string>
+}
+interface CommentResult { source: string; path: string; item: FeedItem; submission?: Submission }
+commentFeedPath(target, date): Promise<string>   // 'b7b/8ec59ab09c61ab7b.json'
+```
+
+- **The file** of a comment is `/appdata/<client-host>/comments/<hash3>/<hash>.json`, the layout RFC-7 recommends: `<hash>` is the first 16 hex characters of the SHA-256 of `<target host> <yyyymmddhh>`, the hour of `date_published` in UTC, and `<hash3>` its last three characters, which spread the files over at most 4,096 directories. Every device finds a comment's file from its target and date. A new file gets `title` "Comments by <host>", `home_page_url`, `feed_url` and the owner's socialspec account, so that targets with `requireSocialSpec` accept it; it has no `_pups` marker and isn't registered.
+- **Writing** is read-modify-write with fresh reads and ETags (`session.update()`): `post()` adds the item at the top, `edit()` replaces it, keeping `id`, `date_published` and `_source.inReplyTo` and setting `date_modified`, `delete()` removes it and deletes the file once it is empty.
+- **Submitting**: after each write, unless `submit: false`, the library waits until the public file shows the change, then sends the webmention with `source` = file URL + `#<id>` to the target's `_submissions.url`. It sends no RFC-11 mentions for comments.
 
 ### Errors
 
@@ -684,16 +705,11 @@ The backend redeems it at `tokenEndpoint` and checks `me` against `identityHosts
 
 ```ts
 const session = await pups.init() ?? await pups.login(domain, { scopes: ['appdata'] })
-const feedPath = 'comments.json'
-const { url } = await session.update(feedPath, async file => {
-  const feed = await file?.json<JsonFeed>() ?? newFeed(session.me, session.publicUrl(feedPath))
-  feed.items.unshift({ id: guid, content_html: html, _in_reply_to: target })
-  return feed
-}, { contentType: 'application/feed+json' })
-await sendWebmention({ source: `${url}#${guid}`, target })
+const { source, submission } = await session.comments.post({ target, content_html: html })
+// later: session.comments.edit(source, { content_html: fixed }), session.comments.delete(source)
 ```
 
-The documentation for this example also covers the RFC's warnings: `public_base` must be on the host of `me` for `requireSocialSpec`, and caching on `public_base` can make the submission fail.
+Comments go into comment feeds in the app's directory, one per target site and hour (RFC-7 "Comment feeds"), never into the owner's main feed. The documentation for this example also covers the RFC's warnings: `public_base` must be on the host of `me` for `requireSocialSpec`, and caching on `public_base` can make the submission fail.
 
 ### SocialSpec profile
 
@@ -713,13 +729,6 @@ const session = await pups.loginWithPopup(domain, { scopes: feedScopes() })
 const feed = session.feed()
 if ((await feed.load()).status == 'missing') await feed.create({ title: "Tim's Notes" })   // registers it in host-meta.json
 await feed.addPost({ title: 'Hello', content_html: '<p>Hi!</p>' })
-```
-
-### An RFC-4 comment in the main feed
-
-```ts
-const { url } = await session.feed().addPost({ content_text: text, _source: { inReplyTo: target } })
-await sendWebmention({ source: url, target })   // the archive URL + '#id', which never changes
 ```
 
 ## Requirements for apps

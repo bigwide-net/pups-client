@@ -882,6 +882,8 @@ export class PupsFeed {
    * and what its `republish` means before the first submission.
    * @throws {PupsError} `not_found`; `invalid_request` if the post answers nothing; `unsupported` if the target
    *   feed takes no submissions.
+   * @deprecated Comments and group posts don't belong in a feed for readers (RFC-7 "Comment feeds"). Use
+   *   `session.comments.post()`, which keeps them in comment feeds in the app's directory.
    */
   async submit(id: string, options: Signal = {}): Promise<Submission> {
     const post = await this.getPost(id, options)

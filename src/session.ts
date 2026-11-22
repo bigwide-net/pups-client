@@ -1,3 +1,4 @@
+import { PupsComments } from './comments.js'
 import { discover, type PupsServer } from './discovery.js'
 import { errorFromResponse, isPupsError, PupsError } from './errors.js'
 import { listFeeds, PupsFeed, type FeedLink, type FeedOptions } from './feed.js'
@@ -100,6 +101,7 @@ export class PupsSession {
   /** Edits `host-meta.json` through the server's host-meta endpoint. */
   readonly hostMeta: HostMetaEditor
   #mentions?: Mentions
+  #comments?: PupsComments
   /** @internal */
   readonly _tokens: TokenManager
   readonly #ctx: SessionContext
@@ -127,6 +129,14 @@ export class PupsSession {
    */
   get mentions(): Mentions {
     return this.#mentions ??= new Mentions({ fetch: this.#ctx.fetch, me: this.me })
+  }
+
+  /**
+   * The owner's comments and posts to discussion groups (RFC-4 submissions), kept in comment feeds in the app's own
+   * directory, never in a feed for readers (RFC-7 "Comment feeds"). Needs the `appdata` scope.
+   */
+  get comments(): PupsComments {
+    return this.#comments ??= new PupsComments(this)
   }
 
   /** The server configuration, pinned at login. */

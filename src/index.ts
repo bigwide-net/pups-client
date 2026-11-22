@@ -42,6 +42,8 @@ export type {
   PupsMarker,
 } from './feed.js'
 export { HostMetaEditor } from './host-meta.js'
+export { PupsComments, commentFeedPath } from './comments.js'
+export type { CommentChanges, CommentInput, CommentResult } from './comments.js'
 export { MENTION_REL, Mentions } from './mentions.js'
 export type { Delivery, DeliveryStatus, FoundItem, MentionReport, MentionSource, MentionsOptions, PlannedMention, PostChange, PostMentions, Submission, SubmissionStatus } from './mentions.js'
 export { accountHost, findHandles, handleText, itemHandles, visibleText } from './handles.js'
