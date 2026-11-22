@@ -4,7 +4,7 @@ import { isPupsError, type PupsErrorCode } from '../src/errors.js'
 import { FEED_REL, feedScopes, POST_URL_TEMPLATE, type FeedDocument, type PupsFeed } from '../src/feed.js'
 import type { Scope } from '../src/scopes.js'
 import { MemoryTokenStore } from '../src/store/memory-store.js'
-import { createMockServer } from './mock-server.js'
+import { createMockServer, type MockOptions } from './mock-server.js'
 
 const clientId = 'https://app.example/oauth/client.json'
 const origin = 'https://tim.example.com'
@@ -14,8 +14,8 @@ afterEach(() => {
   for (const client of clients.splice(0)) client.close()
 })
 
-async function connect(scopes: Scope[] = ['identify', ...feedScopes(), ...feedScopes('photos')]) {
-  const mock = createMockServer({ maxUploadBytes: 1_000_000 })
+async function connect(scopes: Scope[] = ['identify', ...feedScopes(), ...feedScopes('photos')], options: MockOptions = {}) {
+  const mock = createMockServer({ maxUploadBytes: 1_000_000, ...options })
   const client = new PupsClient({ clientId, redirectUri: 'https://app.example/callback', store: new MemoryTokenStore(), fetch: mock.fetch })
   clients.push(client)
   const pending = await client.createAuthorization('tim.example.com', { scopes })
@@ -632,5 +632,61 @@ describe('post URLs', () => {
     expect(read(mock, '/feed.json').items.find(item => item.id == 'old')!.url).toBe(`${origin}/p/feed/post/0`)
     expect((await edited.editPost('own', { title: 'Own' })).item.url).toBe('https://elsewhere.example/1')
     expect((await edited.editPost('own', { url: null })).item.url).toBeUndefined()
+  })
+})
+
+describe('comments', () => {
+  const comments = `${origin}/pups/comments`
+  const withReceiver = () => connect(undefined, { commentEndpoint: true })
+
+  it('opens the feed for comments through the PUPS server, and closes it again', async () => {
+    const { mock, session } = await withReceiver()
+    expect(session.server.commentEndpoint).toBe(comments)
+    const feed = session.feed()
+    expect(feed.commentsAvailable).toBe(true)
+    await feed.create({ title: 'Notes' })
+    expect(feed.comments(read(mock, '/feed.json'))).toBe('off')
+    await feed.enableComments({ policy: { maxLength: 500, requireSocialSpec: true }, tos: `${origin}/tos.html` })
+    const doc = read(mock, '/feed.json')
+    expect(doc._submissions).toEqual({
+      about: 'https://github.com/bigwide-net/RFCs/blob/main/RFC-4-Feed-Submissions.md',
+      url: comments,
+      tos: `${origin}/tos.html`,
+      policies: { comments: { title: 'none', minLength: 2, maxLength: 500, requireSocialSpec: true } },
+      republish: 'no',
+    })
+    expect(feed.comments(doc)).toBe('pups')
+    await feed.disableComments()
+    expect(read(mock, '/feed.json')).not.toHaveProperty('_submissions')
+  })
+
+  it('tells comments through another service apart, and replaces them only when asked', async () => {
+    const { mock, session } = await withReceiver()
+    const feed = session.feed()
+    await feed.create({ title: 'Notes' })
+    await feed.updateSettings({ _submissions: { url: 'https://rm.example.org/groups/tim/mention', republish: 'full' } })
+    expect(feed.comments(read(mock, '/feed.json'))).toBe('other')
+    await feed.enableComments()
+    expect(read(mock, '/feed.json')._submissions).toMatchObject({ url: comments, policies: { comments: { title: 'none', minLength: 2, maxLength: 2000 } } })
+  })
+
+  it('needs a server with a comment endpoint', async () => {
+    const { mock, session } = await connect()
+    const feed = session.feed()
+    await feed.create({ title: 'Notes' })
+    expect(feed.commentsAvailable).toBe(false)
+    expect(await errorCode(feed.enableComments())).toBe('unsupported')
+    await feed.updateSettings({ _submissions: { url: comments, republish: 'no' } })
+    expect(feed.comments(read(mock, '/feed.json'))).toBe('other')
+  })
+
+  it('leaves _submissions out of the archives: the feed file alone says whether the feed accepts comments', async () => {
+    const { mock, session } = await withReceiver()
+    const feed = session.feed()
+    await feed.create({ title: 'Notes' })
+    await feed.enableComments()
+    await postMany(feed, 1, 21)
+    for (const n of [0, 1]) expect(read(mock, `/feed/feed.00000${n}.json`)).not.toHaveProperty('_submissions')
+    expect(read(mock, '/feed.json')._submissions).toMatchObject({ url: comments })
   })
 })

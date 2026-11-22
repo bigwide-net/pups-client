@@ -43,6 +43,11 @@ export interface PupsServer {
   hostMetaEndpoint?: string
   /** Present only if the server can't accept `PUT` and `DELETE`; all writes then go here. */
   postEndpoint?: string
+  /**
+   * Present if the server accepts RFC-4 comments on posts of the owner's feeds and writes them into the owner's inbox
+   * (RFC-6 "Built-in receiver"). Feeds opt in with `feed.enableComments()`.
+   */
+  commentEndpoint?: string
   maxUploadBytes: number
   specVersion: string
   /** The configuration document as fetched, including fields this library doesn't know. */
@@ -161,6 +166,7 @@ export function parseConfig(json: unknown, domain: string, identityHosts: string
 
   const hostMetaEndpoint = optionalHttps('host_meta_endpoint')
   const postEndpoint = optionalHttps('post_endpoint')
+  const commentEndpoint = optionalHttps('comment_endpoint')
   return {
     domain,
     identityHosts,
@@ -174,6 +180,7 @@ export function parseConfig(json: unknown, domain: string, identityHosts: string
     wellKnownPaths,
     ...hostMetaEndpoint ? { hostMetaEndpoint } : {},
     ...postEndpoint ? { postEndpoint } : {},
+    ...commentEndpoint ? { commentEndpoint } : {},
     maxUploadBytes: maxUploadBytes as number,
     specVersion,
     raw,

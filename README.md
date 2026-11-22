@@ -145,6 +145,8 @@ console.log(post.item.url)                                        // the post's 
 await feed.editPost(post.id, { title: 'Hello, world' })           // wherever the post is now, sets date_modified
 await feed.deletePost(post.id, { deleteMedia: true })             // also deletes media no other post uses
 await feed.updateSettings({ description: 'Longer notes', _podcast: { explicit: false } })
+if (feed.commentsAvailable && feed.comments(state.feed) == 'off')
+  await feed.enableComments({ policy: { maxLength: 1000 } })       // comments go into the owner's inbox
 
 for await (const item of feed.posts()) console.log(item.id)       // newest first, through all archives
 const feeds = await session.listFeeds()                           // the feeds registered in host-meta.json
@@ -153,8 +155,41 @@ const feeds = await session.listFeeds()                           // the feeds r
 - **Archives.** Every post goes into the newest archive, `feed.000000.json`, `feed.000001.json`, … in the feed directory, 20 posts each, linked with `next_url`; posts never move. The feed file holds a copy of the newest 30 posts and points to the newest archive with `_pups.archive_url`; archives point back with `_pups.updates_url`. `session.feed(name, { maxItems, archiveSize, maxBytes })` changes the sizes. Archives are optional in RFC-7: with `{ startArchives: false }`, a feed without archives stays a plain feed file with the newest posts; a feed that has archives always keeps them.
 - **Concurrency.** Every change is a read-modify-write with ETags, repeated when another app or the owner wrote in between. The archive is always written before the feed file, so no post is ever lost, and the next post repairs a feed file that an interrupted post didn't reach.
 - **Post URLs.** `addPost()` returns `url`, the post's archive URL plus `#<id>`. It never changes, so it can be the `source` of an RFC-4 webmention. If the site has a homepage that shows single posts, such as webpup, `host-meta.json` declares their URLs with the property `https://bigwide.net/ns/post-url-template` (`POST_URL_TEMPLATE`), e.g. `https://tim.example/p/{feed}/post/{index}`. Posts of a feed with archives then get the URL of their page as `url`, unless the app sets one; `editPost()` adds it to older posts that have none. Show `post.item.url` as the post's link; `session.feed(name, { postUrls: false })` turns this off.
+- **Comments on your feed.** If the server has a `comment_endpoint` (RFC-6 "Built-in receiver"), `feed.enableComments({ policy, tos })` opens the feed for RFC-4 comments: it writes `_submissions` into the feed file, with the endpoint as `url`, a `comments` policy and `republish: "no"`, and the server puts the comments into the owner's inbox. `feed.disableComments()` removes it, `feed.comments(doc)` tells whether comments go to this server (`pups`), another service (`other`) or nowhere (`off`). Archives don't copy `_submissions`: the feed file alone decides. Single posts are closed with `_commenting: { allowComments: false }`.
 - **Indexes.** Every post gets an index, `_pups.index` (also `PostResult.index`, or `itemIndex(item)`): 0 for the first post, then counting up, never changed and never given out again, with the counter `_pups.next_index` in the newest archive. Readers can number the posts and load only the archives they need. A feed written before indexes existed is indexed on its next post, or with `feed.assignIndexes()`; posts of apps that don't know indexes get theirs on the next post.
 - Errors: `not_pups_controlled` for feeds without the marker, `invalid_feed` for files that aren't JSON Feeds, `not_found` for a missing feed or post.
+
+### Mentions and submissions
+
+A feed can tell the people a post names or answers ([RFC-11](https://github.com/bigwide-net/RFCs/blob/main/RFC-11-Mentions.md)), and submit comments to other feeds ([RFC-4](https://github.com/bigwide-net/RFCs/blob/main/RFC-4-Feed-Submissions.md)):
+
+```ts
+const feed = session.feed(undefined, { mentions: true })
+const post = await feed.addPost({ content_html: '<p>Great talk by <a href="https://alice.example/">@alice.example</a></p>' })
+for (const r of await post.mentions ?? []) console.log(r.account, r.status)   // @alice.example accepted
+
+const comment = await feed.addPost({ content_text: 'Agreed!', _source: { inReplyTo: 'https://rm.example/groups/g/posts.json#a8Kd03' } })
+const submission = await feed.submit(comment.id)                  // to the target feed's _submissions.url
+await session.mentions.submissionStatus(submission.statusUrl!)    // { status: 'success', pubUrl: … }
+
+await session.mentions.notify(source, '@alice.example')           // the generic interface: any source, any account
+await session.mentions.reply(source, 'https://bob.example/feed.json#p-12')
+```
+
+- **Asking first.** `feed.planMentions(input)` lists the accounts a post would notify, without sending anything, so the app can ask before posting. Each write takes `{ mentions }`: `true`, `false` (post without mentions), or the confirmed list:
+
+  ```ts
+  const planned = await feed.planMentions(input)               // [{ account: '@alice.example', kind: 'mention', target }]
+  const confirmed = planned.length && await confirmDialog(planned) ? planned : false
+  await feed.addPost(input, { mentions: confirmed })
+  ```
+
+  For an edit, plan with the new version and `{ previous: oldItem }`; for a delete, `planMentions(undefined, { previous: oldItem })`. `{ discover: true }` leaves out the domains without an endpoint, but looks them up before the post is published, which tells them that it names them.
+- **Automatic mentions.** With `{ mentions: true }`, `addPost()`, `editPost()` and `deletePost()` find the handles in the post's title and visible text, e.g. `@alice.example`, also lists like `@alice.example/@bob.example`, but not e-mail addresses, fediverse addresses, names without a dot or paths. The author of the item a post answers (`_source.inReplyTo`) gets a reply mention. Each account is notified once, never the owner, at most 20 per post; after an edit or delete, everyone the old or the new version named.
+- **After the upload.** The mentions are sent in the background, once the post is visible at its public URL (so that a CDN doesn't hand the receiver an old copy), with the archive URL plus `#<id>` as `source`. `post.mentions` resolves to one report per account (`accepted`, `rejected`, `failed`, `unknown` or `no-endpoint`) and never rejects; a failed mention never fails the post. Network errors, `5xx` and `429` are retried a few times; `feed.sendMentions(id)` sends again later.
+- **Discovery.** The endpoint is the link `https://bigwide.net/ns/mention` in the domain's `host-meta.json`, cached for a day, failures for an hour. A domain without one, or whose `host-meta.json` doesn't allow CORS, gets nothing. An endpoint without CORS headers still receives the mention; its report says `unknown`.
+- **Replies to RFC-4 feeds** are submissions, not mentions: if the answered feed has `_submissions`, no mentions are sent (the RFC-4 server sends them once it republishes the comment). Submitting is never automatic, because the app must first show the target's terms of service and what `republish` means: call `feed.submit(id)` after `addPost()`, and again after `editPost()` or `deletePost()`.
+- `new Mentions({ fetch })` works without a session. `findHandles()`, `itemHandles()` and `visibleText()` are exported too.
 
 ### What the library does for you
 

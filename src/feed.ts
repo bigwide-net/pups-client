@@ -1,9 +1,11 @@
 import { isPupsError, PupsError } from './errors.js'
 import { fileTypes } from './file-types.js'
 import { pathFromPublicUrl } from './paths.js'
+import { itemHandles } from './handles.js'
+import type { Mentions, MentionReport, MentionSource, PlannedMention, Submission } from './mentions.js'
 import type { Scope } from './scopes.js'
 import type { Body, PupsSession } from './session.js'
-import { randomString } from './util.js'
+import { isObject, randomString } from './util.js'
 
 /** The link relation that registers a feed in `host-meta.json` (RFC-7). A placeholder in RFC-7. */
 export const FEED_REL = 'https://bigwide.net/ns/feed'
@@ -18,6 +20,7 @@ export const POST_URL_TEMPLATE = 'https://bigwide.net/ns/post-url-template'
 export const PUPS_FEED_SPEC = 'https://github.com/bigwide-net/RFCs/blob/main/RFC-7-Feed-Publishing-with-PUPS.md'
 
 const RFC1_URL = 'https://github.com/bigwide-net/RFCs/blob/main/RFC-1-Source-for-JSON-Feeds.md'
+const RFC4_URL = 'https://github.com/bigwide-net/RFCs/blob/main/RFC-4-Feed-Submissions.md'
 const JSON_FEED_VERSION = 'https://jsonfeed.org/version/1.1'
 const FEED_CONTENT_TYPE = 'application/feed+json'
 const maxArchiveNumber = 999_999
@@ -131,6 +134,26 @@ export interface FeedSettings {
   [extension: `_${string}`]: unknown
 }
 
+/**
+ * The rules for comments of RFC-4 "Policies". Missing rules have RFC-4's defaults; servers may add others. The PUPS
+ * server's receiver enforces `title`, `minLength`, `maxLength`, `requireSocialSpec`, `allowEdit` and `allowDelete`.
+ */
+export interface CommentPolicy {
+  title?: 'required' | 'allowed' | 'none'
+  minLength?: number
+  maxLength?: number
+  requireSocialSpec?: boolean
+  allowEdit?: boolean
+  allowDelete?: boolean
+  [rule: string]: unknown
+}
+
+/**
+ * Whether a feed accepts comments (RFC-4 `_submissions`): `pups` through the PUPS server's receiver, `other`
+ * through another service, such as an rssmention server, or `off`.
+ */
+export type CommentsState = 'pups' | 'other' | 'off'
+
 /** Changes to the settings: a value sets the field, `null` removes it, `undefined` leaves it unchanged. */
 export type FeedSettingsChanges = { [K in keyof FeedSettings]?: FeedSettings[K] | null }
 
@@ -189,6 +212,11 @@ export interface PostResult {
    * as the `source` of an RFC-4 webmention. In a feed without archives, the feed file's URL plus `#<id>`.
    */
   url: string
+  /**
+   * With the option `mentions`: the RFC-11 mentions, sent once the post is visible at its public URL. Never
+   * rejects. Missing if the post names and answers no one.
+   */
+  mentions?: Promise<MentionReport[]>
 }
 
 export interface MediaResult {
@@ -233,6 +261,12 @@ export interface FeedOptions {
    * declares one and the post has no `url` (RFC-7 "Post URLs"). Default true.
    */
   postUrls?: boolean
+  /**
+   * Whether to send RFC-11 mentions after `addPost()`, `editPost()` and `deletePost()`: to the domains a post names
+   * (`@tim.example.com`) and to the author of the item it answers. `true` uses `session.mentions`. Default false.
+   * Each write can decide otherwise with its own option `mentions`, e.g. with the accounts the author confirmed.
+   */
+  mentions?: boolean | Mentions
 }
 
 /** A feed registered in `host-meta.json`. */
@@ -245,6 +279,13 @@ export interface FeedLink {
 }
 
 type Signal = { signal?: AbortSignal }
+
+/**
+ * Which RFC-11 mentions a write sends: `true` all of them, `false` none, or a list from `planMentions()`, e.g. the
+ * accounts the author confirmed. Default: the feed's option `mentions`.
+ */
+export type MentionChoice = boolean | PlannedMention[]
+type WithMentions = Signal & { mentions?: MentionChoice }
 
 interface Loaded {
   path: string
@@ -273,8 +314,6 @@ function feedPaths(name?: string): { path: `/${string}`; directory: `/${string}`
   return { path: `/feed/${name}.json`, directory: `/feed/${name}/` }
 }
 
-const isObject = (value: unknown): value is Record<string, unknown> =>
-  !!value && typeof value == 'object' && !Array.isArray(value)
 
 const isFeedDocument = (value: unknown): value is FeedDocument =>
   isObject(value) && typeof value.version == 'string' && value.version.startsWith('https://jsonfeed.org/version/1')
@@ -386,6 +425,7 @@ export class PupsFeed {
   readonly #maxBytes?: number
   readonly #maxAttempts: number
   readonly #postUrls: boolean
+  readonly #mentions?: Mentions
   #template?: Promise<string | undefined>
 
   /** @internal Use `session.feed()`. */
@@ -401,6 +441,7 @@ export class PupsFeed {
     this.#maxBytes = options.maxBytes
     this.#maxAttempts = options.maxAttempts ?? 8
     this.#postUrls = options.postUrls ?? true
+    this.#mentions = options.mentions === true ? session.mentions : options.mentions || undefined
     if (!(this.#archiveSize >= 1 && this.#maxItems >= 1))
       throw new PupsError('invalid_request', 'Feed options: maxItems and archiveSize must be at least 1.')
   }
@@ -526,6 +567,52 @@ export class PupsFeed {
     return this.#setImage('favicon', media, options.signal)
   }
 
+  /** Whether the PUPS server can receive comments on the feed's posts (`comment_endpoint`, RFC-6 "Built-in receiver"). */
+  get commentsAvailable(): boolean {
+    return !!this.#session.server.commentEndpoint
+  }
+
+  /** Whether the feed accepts comments, and through whom; `doc` is the feed file, e.g. from `load()`. */
+  comments(doc: FeedDocument): CommentsState {
+    const submissions = doc._submissions
+    if (!isObject(submissions)) return 'off'
+    const endpoint = this.#session.server.commentEndpoint
+    return endpoint && submissions.url == endpoint ? 'pups' : 'other'
+  }
+
+  /**
+   * Lets readers comment on the feed's posts through the PUPS server, which puts the comments into the owner's inbox
+   * (RFC-6 "Built-in receiver"): writes RFC-4 `_submissions` into the feed file, with `comment_endpoint` as `url`,
+   * the comments policy (RFC-4's defaults for `title`, `minLength` and `maxLength`, overridden by `policy`) and
+   * `republish: "no"`. Replaces the `_submissions` of another service; check `comments()` first and ask the owner.
+   * Single posts are closed with `_commenting: { allowComments: false }` (RFC-4).
+   * @throws {PupsError} `unsupported` if the server has no `comment_endpoint`.
+   */
+  async enableComments(settings: { policy?: CommentPolicy; tos?: string } = {}, options: Signal = {}): Promise<FeedDocument> {
+    const url = this.#session.server.commentEndpoint
+    if (!url) throw new PupsError('unsupported', 'This PUPS server doesn\'t receive comments: its configuration has no comment_endpoint (RFC-6, Built-in receiver).')
+    return this.#setSubmissions({
+      about: RFC4_URL,
+      url,
+      ...settings.tos ? { tos: settings.tos } : {},
+      policies: { comments: { title: 'none', minLength: 2, maxLength: 2000, ...settings.policy } },
+      republish: 'no',
+    }, options.signal)
+  }
+
+  /** Closes the feed for comments: removes `_submissions` from the feed file, whichever service it names. */
+  disableComments(options: Signal = {}): Promise<FeedDocument> {
+    return this.#setSubmissions(undefined, options.signal)
+  }
+
+  #setSubmissions(submissions: Record<string, unknown> | undefined, signal?: AbortSignal): Promise<FeedDocument> {
+    return this.#transaction(async () => {
+      const main = await this.#readControlled(this.path, signal)
+      const { _submissions: _old, ...doc } = main.doc
+      return this.#writeMain(submissions ? { ...doc, _submissions: submissions } : doc, main.etag, signal)
+    })
+  }
+
   /**
    * Uploads an image, audio or video file into the feed directory under a new, unique name, by default
    * `images/<year>/…` for images and `media/<year>/…` for everything else. Reference it from a post by its `url`.
@@ -548,11 +635,13 @@ export class PupsFeed {
    * media with `uploadMedia()` before posting.
    * In a feed with archives, a post without `url` gets one from the site's post URL template, if `host-meta.json`
    * has one and `postUrls` isn't false: the page that shows the post (RFC-7 "Post URLs").
+   * With the option `mentions`, the domains the post names and the author of the item it answers are notified
+   * (RFC-11) once the post is visible; see `PostResult.mentions`.
    * @returns the post, with `url`: its archive's URL plus `#<id>`, which never changes; for a feed without
    *   archives, the feed file's URL plus `#<id>`, valid while the post is among the newest. The post's page, if it
    *   has one, is `item.url`.
    */
-  async addPost(input: PostInput, options: Signal = {}): Promise<PostResult> {
+  async addPost(input: PostInput, options: WithMentions = {}): Promise<PostResult> {
     const item = this.#newItem(input)
     const signal = options.signal
     let archiveUrl = ''
@@ -596,7 +685,7 @@ export class PupsFeed {
       doc.items = this.#newestItems(added.recent, doc.items, doc)
       await this.#writeMain(doc, main.etag, signal)
     })
-    return this.#result(stored, archiveUrl)
+    return this.#withMentions(options.mentions, this.#result(stored, archiveUrl), archiveUrl, stored, undefined, item => !!item)
   }
 
   /**
@@ -653,13 +742,16 @@ export class PupsFeed {
    * a function that gets a copy of the item and returns the new item, or `undefined` to leave it unchanged. The
    * function may run more than once.
    *
-   * Apps should edit posts only when the owner asks them to, whichever app created them. A post of a feed with
+   * Apps should edit posts only when the owner asks them to, whichever app created them. With the option
+   * `mentions`, everyone the old or the new version mentions is notified. A post of a feed with
    * archives that has no `url`, and had none before, gets one from the post URL template, as in `addPost()`.
    * @throws {PupsError} `not_found`
    */
-  async editPost(id: string, changes: PostChanges | ((item: FeedItem) => FeedItem | undefined | Promise<FeedItem | undefined>), options: Signal = {}): Promise<PostResult> {
+  async editPost(id: string, changes: PostChanges | ((item: FeedItem) => FeedItem | undefined | Promise<FeedItem | undefined>), options: WithMentions = {}): Promise<PostResult> {
     const signal = options.signal
-    return this.#transaction(async () => {
+    let edit: { old: FeedItem; item: FeedItem; fileUrl: string } | undefined
+    const result = await this.#transaction(async () => {
+      edit = undefined
       const { main, file, index } = await this.#findWritable(id, signal)
       const old = file.doc.items[index]!
       const fileUrl = this.#session.publicUrl(file.path)
@@ -675,8 +767,11 @@ export class PupsFeed {
       if (file != main) await this.#writeArchive(file, replaceAt(file.doc.items, index, item), signal)
       const mainIndex = main.doc.items.findIndex(i => i.id == id)
       if (mainIndex >= 0) await this.#writeMain({ ...main.doc, items: replaceAt(main.doc.items, mainIndex, item) }, main.etag, signal)
+      edit = { old, item, fileUrl }
       return this.#result(item, fileUrl)
     })
+    const done = edit as typeof edit
+    return done ? this.#withMentions(options.mentions, result, done.fileUrl, done.item, done.old, found => found?.date_modified == done.item.date_modified) : result
   }
 
   /**
@@ -686,10 +781,12 @@ export class PupsFeed {
    * @returns the deleted item, and the public URLs of the deleted media files.
    * @throws {PupsError} `not_found`
    */
-  async deletePost(id: string, options: Signal & { deleteMedia?: boolean } = {}): Promise<{ item: FeedItem; deletedMedia: string[] }> {
+  async deletePost(id: string, options: WithMentions & { deleteMedia?: boolean } = {}): Promise<{ item: FeedItem; deletedMedia: string[]; mentions?: Promise<MentionReport[]> }> {
     const signal = options.signal
+    let fileUrl = ''
     const item = await this.#transaction(async () => {
       const { main, file, index } = await this.#findWritable(id, signal)
+      fileUrl = this.#session.publicUrl(file.path)
       const item = file.doc.items[index]!
       if (file != main) {
         await this.#writeArchive(file, file.doc.items.filter(i => i.id != id), signal)
@@ -715,7 +812,77 @@ export class PupsFeed {
         if (path && await this.#deleteQuietly(path, signal)) deletedMedia.push(url)
       }
     }
-    return { item, deletedMedia }
+    const mentions = this.#sendMentions(options.mentions, fileUrl, undefined, item, found => !found)
+    return { item, deletedMedia, ...mentions ? { mentions } : {} }
+  }
+
+  /**
+   * Sends the RFC-11 mentions of a post now, e.g. to try again those that failed (see `Mentions.notifyAll()`). With
+   * `previous`, the version before an edit, also to the accounts that one mentioned.
+   * @throws {PupsError} `not_found`
+   */
+  async sendMentions(id: string, options: Signal & { previous?: FeedItem } = {}): Promise<MentionReport[]> {
+    const post = await this.getPost(id, options)
+    if (!post) throw new PupsError('not_found', `The feed has no post with the id "${id}".`)
+    return this.#mentionSender.notifyAll({ source: post.url, item: post.item, previous: options.previous, me: this.#session.me }, options)
+  }
+
+  /**
+   * Submits a post that answers an item of an RFC-4 feed, e.g. a comment, to that feed's `_submissions.url`
+   * (RFC-4 "Submitting"): `source` is the post's archive URL plus `#<id>`, `target` its `_source.inReplyTo`. Call it
+   * after `addPost()` or `editPost()`, also to submit an edit or a delete again. Show the target's terms of service
+   * and what its `republish` means before the first submission.
+   * @throws {PupsError} `not_found`; `invalid_request` if the post answers nothing; `unsupported` if the target
+   *   feed takes no submissions.
+   */
+  async submit(id: string, options: Signal = {}): Promise<Submission> {
+    const post = await this.getPost(id, options)
+    if (!post) throw new PupsError('not_found', `The feed has no post with the id "${id}".`)
+    const source = isObject(post.item._source) ? post.item._source : {}
+    if (typeof source.inReplyTo != 'string') throw new PupsError('invalid_request', `The post "${id}" has no _source.inReplyTo, so it answers nothing (RFC-4).`)
+    return this.#session.mentions.submit(post.url, source.inReplyTo, options)
+  }
+
+  /**
+   * The RFC-11 mentions a post would send (see `Mentions.plan()`), e.g. to ask the author before posting:
+   *
+   * ```ts
+   * const planned = await feed.planMentions(input)
+   * const confirmed = planned.length && await askToNotify(planned) ? planned : false   // the app's dialog
+   * await feed.addPost(input, { mentions: confirmed })
+   * ```
+   *
+   * For an edit, pass the post as it will be and the current version as `previous`; for a delete, only `previous`.
+   */
+  planMentions(post: MentionSource | undefined, options: Signal & { previous?: MentionSource; discover?: boolean } = {}): Promise<PlannedMention[]> {
+    return this.#mentionSender.plan({ item: post, previous: options.previous, me: this.#session.me }, options)
+  }
+
+  get #mentionSender(): Mentions {
+    return this.#mentions ?? this.#session.mentions
+  }
+
+  /** The result with the RFC-11 mentions of the post, if the write sends them (see `#sendMentions()`). */
+  #withMentions(choice: MentionChoice | undefined, result: PostResult, fileUrl: string, item: FeedItem, previous: FeedItem | undefined, ready: (item?: FeedItem) => boolean): PostResult {
+    const mentions = this.#sendMentions(choice, fileUrl, item, previous, ready)
+    return mentions ? { ...result, mentions } : result
+  }
+
+  /**
+   * Sends the RFC-11 mentions of a post in the background, once its file at `fileUrl` is in the state `ready` wants:
+   * all, none, or the planned ones, as `choice` (default: the feed's option) says. Undefined if nothing is sent.
+   */
+  #sendMentions(choice: MentionChoice | undefined, fileUrl: string, item: FeedItem | undefined, previous: FeedItem | undefined, ready: (item?: FeedItem) => boolean): Promise<MentionReport[]> | undefined {
+    choice ??= !!this.#mentions
+    const relevant = (i?: FeedItem) => !!i && (itemHandles(i).length > 0 || (isObject(i._source) && typeof i._source.inReplyTo == 'string'))
+    if (Array.isArray(choice) ? !choice.length : !choice || !(relevant(item) || relevant(previous))) return
+    const mentions = this.#mentionSender
+    const id = (item ?? previous)!.id
+    const source = `${fileUrl}#${encodeURIComponent(id)}`
+    return (async () => {
+      await mentions.waitForItem(fileUrl, id, ready)
+      return Array.isArray(choice) ? mentions.sendPlanned(source, choice) : mentions.notifyAll({ source, item, previous, me: this.#session.me })
+    })().catch(() => [])
   }
 
   // Reading
@@ -862,9 +1029,12 @@ export class PupsFeed {
     return match ? Number(match[1]) : undefined
   }
 
-  /** A new archive with the feed fields of the feed file (RFC-7 "Archives"). */
+  /**
+   * A new archive with the feed fields of the feed file (RFC-7 "Archives"), except `_submissions`: whether a feed
+   * accepts comments is said by its feed file alone.
+   */
   #newArchive(n: number, main: FeedDocument, items: FeedItem[], nextUrl: string | undefined, nextIndex?: number): FeedDocument {
-    const { items: _items, next_url: _next, user_comment: _comment, hubs: _hubs, author: _author, _pups, ...fields } = main
+    const { items: _items, next_url: _next, user_comment: _comment, hubs: _hubs, author: _author, _pups, _submissions: _s, ...fields } = main
     const { archive_url: _archive, next_index: _counter, ...marker } = _pups ?? {}
     const podcast = fields._podcast
     if (isObject(podcast) && 'liveItems' in podcast) {

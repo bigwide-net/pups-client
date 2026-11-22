@@ -9,6 +9,8 @@ export interface MockOptions {
   domain?: string
   postFallback?: boolean
   hostMetaEndpoint?: boolean
+  /** Whether the server has a built-in receiver for comments (`comment_endpoint`). */
+  commentEndpoint?: boolean
   /** Lifetime of the access token from the code exchange. Refreshed access tokens live 3600 seconds. */
   expiresIn?: number
   graceMs?: number
@@ -50,6 +52,7 @@ export function createMockServer(options: MockOptions = {}) {
     ],
     ...options.hostMetaEndpoint ?? true ? { host_meta_endpoint: `${origin}/pups/host-meta` } : {},
     ...options.postFallback ? { post_endpoint: `${origin}/pups/post` } : {},
+    ...options.commentEndpoint ? { comment_endpoint: `${origin}/pups/comments` } : {},
     max_upload_bytes: options.maxUploadBytes ?? 1000,
     spec_version: '0.1',
   }

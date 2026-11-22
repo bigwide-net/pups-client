@@ -1,5 +1,9 @@
 import { PupsError } from './errors.js'
 
+/** Whether `value` is a plain object, not an array or null. */
+export const isObject = (value: unknown): value is Record<string, unknown> =>
+  !!value && typeof value == 'object' && !Array.isArray(value)
+
 /** Base64url without padding (RFC 4648 §5), as PKCE requires. */
 export function base64url(bytes: Uint8Array): string {
   let binary = ''

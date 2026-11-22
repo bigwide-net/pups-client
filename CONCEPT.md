@@ -393,6 +393,16 @@ interface PupsFeed {
   setFavicon(media: MediaInput | null): Promise<FeedDocument>
   uploadMedia(media: MediaInput, options?: { folder?: string }): Promise<MediaResult>
 
+  commentsAvailable: boolean                      // the server has a comment_endpoint
+  comments(doc: FeedDocument): 'pups' | 'other' | 'off'
+  enableComments(settings?: { policy?: CommentPolicy; tos?: string }): Promise<FeedDocument>
+  disableComments(): Promise<FeedDocument>
+
+  planMentions(post?: MentionSource, options?: { previous?: MentionSource; discover?: boolean }): Promise<PlannedMention[]>
+  sendMentions(id: string, options?: { previous?: FeedItem }): Promise<MentionReport[]>
+  // addPost, editPost and deletePost take { mentions?: boolean | PlannedMention[] }: all, none, or the confirmed ones
+  submit(id: string): Promise<Submission>             // RFC-4, to the target's _submissions.url
+
   addPost(post: PostInput): Promise<PostResult>   // url: the post's archive URL + '#id'; index: _pups.index
   assignIndexes(): Promise<void>                  // index a feed written before RFC-7 had indexes
   getPost(id: string): Promise<PostResult | undefined>
@@ -408,8 +418,35 @@ interface PupsFeed {
 - **Posting.** `addPost()` adds the post to the newest archive (the one `_pups.archive_url` names), or creates a new archive linked to it once the newest holds `archiveSize` (20) posts, and then inserts it at the top of the feed file, which keeps the newest `maxItems` (30), fewer with `maxBytes`. The archive is written first; the feed file always takes all posts of the newest archive, which repairs interrupted posts. Every step is repeated on `412`, up to `maxAttempts` (8). A feed without `archive_url` (new, written by simple clients, or handed over) gets its existing items archived first, oldest first, with its old `next_url` at the end of the chain, unless `startArchives` is false: then posts only go into the feed file, as RFC-7 allows for clients without archive support.
 - **Post URLs.** `PostResult.url` is the post's archive URL plus `#<id>`. Posts never leave their archive, so it never changes; an RFC-4 webmention uses it as `source`. The item's own `url` is the post's page (RFC-7 "Post URLs"): for a feed with archives, `addPost()` reads the site property `https://bigwide.net/ns/post-url-template` from `host-meta.json` once per `PupsFeed`, and fills `{feed}` (the feed file's path without `.json`: `feed`, `feed/photos`), `{index}` and `{id}` into the item it writes, in the same write that gives out the index. A `url` the app gives is kept. `editPost()` adds the url to a post that never had one, but neither changes nor restores one. Templates that aren't https or lack `{index}` and `{id}` are ignored, as is a `host-meta.json` that can't be read; `postUrls: false` turns it off.
 - **Indexes** (RFC-7 "Indexes"). Every post gets `_pups.index` from the counter `_pups.next_index` of the newest archive (of the feed file, without archives), in the same ETag-protected write that adds it; a new archive takes the counter over. Indexes never change and are never reused, so deleted posts leave gaps. Before writing the counter's file, posts without an index (from apps that don't know indexes) get the next ones, oldest first. A newest archive without a counter means the feed hasn't been indexed: `addPost()` then reads all PUPS archives, numbers the unindexed posts in archive order above the highest index found, writes the changed archives oldest first (the newest last, with the counter) and the feed file's copies, and starts the post again. `assignIndexes()` does the same without posting.
+- **Comments** (RFC-6 "Built-in receiver", RFC-4). `enableComments()` writes `_submissions` into the feed file: `url` is the server's `comment_endpoint`, `policies.comments` has `title: "none"`, `minLength: 2` and `maxLength: 2000` unless the app's policy says otherwise, and `republish` is `no`, since the receiver only delivers to the inbox. It replaces `_submissions` of another service, so apps check `comments()` first. New archives don't get a copy of `_submissions` (RFC-7 "Archives"); a server takes it from the feed file at `_pups.updates_url` when a comment targets an archive.
 - **Editing and deleting** find the post in the archives, from `_pups.archive_url` along `next_url`, change its archive, and then the feed file if the post is there. After a delete, the feed file is filled up again from the archives. `deletePost(id, { deleteMedia: true })` reads all archives to find media no other post references.
 - **Ids** are 16 random URL-safe characters unless given; `date_published` defaults to now; `markdown` goes into `_source.markdown` (RFC-1), with `content_text` as the fallback JSON Feed requires.
+
+### `Mentions`
+
+Sends webmentions ([RFC-11](https://github.com/bigwide-net/RFCs/blob/main/RFC-11-Mentions.md) mentions, [RFC-4](https://github.com/bigwide-net/RFCs/blob/main/RFC-4-Feed-Submissions.md) submissions). `session.mentions` shares one instance, and its discovery cache, across the session's feeds; `new Mentions({ fetch, retryDelays, visibilityDelays })` works without a session.
+
+```ts
+class Mentions {
+  discover(domain: string): Promise<string | undefined>                     // host-meta.json, rel https://bigwide.net/ns/mention
+  send(endpoint: string, source: string, target: string): Promise<Delivery>  // form-encoded POST, with retries
+  notify(source: string, account: string, options?: { target?: string }): Promise<MentionReport>
+  reply(source: string, target: string): Promise<MentionReport | undefined>  // to the author of the answered item
+  plan(post: { item?: MentionSource; previous?: MentionSource; me?: string }, options?: { discover?: boolean }): Promise<PlannedMention[]>
+  sendPlanned(source: string, planned: PlannedMention[]): Promise<MentionReport[]>
+  notifyAll(post: { source: string; item?: FeedItem; previous?: FeedItem; me?: string }): Promise<MentionReport[]>  // plan + sendPlanned
+  submit(source: string, target: string, options?: { endpoint?: string }): Promise<Submission>
+  submissionStatus(statusUrl: string): Promise<SubmissionStatus>
+  findItem(ref: string): Promise<FoundItem>                                  // feed URL + '#id', through the archives
+  waitForItem(feedUrl: string, id: string, ready: (item?: FeedItem) => boolean): Promise<boolean>
+}
+```
+
+- **Handles** (RFC-11 "Handles") are found in the title and the visible text of `content_html` (without `code`, `pre`, attribute values and hidden elements), else in `content_text`. A small tokenizer reads the HTML, so it works without a DOM. A `/` directly between handles separates them (`@a.example/@b.example`); pups-php's receiver uses the same rules.
+- **Asking first.** `plan()` returns the accounts without sending anything (it reads only the feeds of answered items; with `discover`, also the `host-meta.json` of each domain, and drops those without an endpoint). The app shows them, and passes the confirmed list as the write's `mentions` option, `false` to post without mentions; `sendPlanned()` sends exactly that list once the post is visible.
+- **`plan()`** first reads the items the post and its previous version answer: if one is in a feed with `_submissions` (for an RFC-7 archive, those of its feed file), the post is an RFC-4 submission and nothing is sent. Otherwise the item's socialspec account (or the feed's, if the feed has no `_submissions`) gets a reply mention with the item as target, and every other named host a mention with its root URL as target. Never `me`, each host once, at most 20.
+- **Sending**: `POST` with `source` and `target`, form-encoded, without credentials. `2xx` is `accepted`, other `4xx` `rejected` (with `message` and `code` from a JSON body), network errors, `5xx` and `429` `failed` after the `retryDelays` (10 s, 1 min, 5 min; a longer `Retry-After` up to 10 minutes). A browser can't read the answer of an endpoint without CORS headers: the request is sent again in `no-cors` mode, which a simple request allows, and reported as `unknown`.
+- **Feeds** with the option `mentions` call `waitForItem()` on the post's public file (polling without cache until the item is there, changed or gone, about half a minute at most), then `notifyAll()`, in the background; `PostResult.mentions` holds the promise. `feed.sendMentions(id)` sends again; `feed.submit(id)` submits a post to the feed its `_source.inReplyTo` names.
 
 ### Errors
 

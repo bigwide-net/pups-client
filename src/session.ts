@@ -3,6 +3,7 @@ import { errorFromResponse, isPupsError, PupsError } from './errors.js'
 import { listFeeds, PupsFeed, type FeedLink, type FeedOptions } from './feed.js'
 import { fileTypeOf, uploadContentType } from './file-types.js'
 import { HostMetaEditor } from './host-meta.js'
+import { Mentions } from './mentions.js'
 import { revokeToken } from './oauth.js'
 import { isPrivate, publicUrl, resolvePath, scopeCovers, storageUrl, validatePath } from './paths.js'
 import {
@@ -98,6 +99,7 @@ export class PupsSession {
   readonly privatePath: string
   /** Edits `host-meta.json` through the server's host-meta endpoint. */
   readonly hostMeta: HostMetaEditor
+  #mentions?: Mentions
   /** @internal */
   readonly _tokens: TokenManager
   readonly #ctx: SessionContext
@@ -117,6 +119,14 @@ export class PupsSession {
       onExpired: error => ctx.ended(this, { type: 'expired', me: this.me, error }),
     })
     this.hostMeta = new HostMetaEditor(this, ctx.fetch)
+  }
+
+  /**
+   * Sends webmentions: RFC-11 mentions to domains, RFC-4 submissions to feeds. Shared by the session's feeds, so
+   * that they share the discovery cache.
+   */
+  get mentions(): Mentions {
+    return this.#mentions ??= new Mentions({ fetch: this.#ctx.fetch, me: this.me })
   }
 
   /** The server configuration, pinned at login. */
