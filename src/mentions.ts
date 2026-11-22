@@ -151,6 +151,10 @@ function splitRef(ref: string): [string, string | undefined] {
   return [ref.slice(0, at), id]
 }
 
+/** A field of a feed's RFC-13 `_archive`, or of `_pups` in feeds of earlier drafts (RFC-13 "Earlier drafts"). */
+const archiveField = (doc: Record<string, unknown>, key: string): unknown =>
+  (isObject(doc._archive) ? doc._archive[key] : undefined) ?? (isObject(doc._pups) ? doc._pups[key] : undefined)
+
 /**
  * Sends webmentions: RFC-11 mentions to the domains a post names or answers, found through their `host-meta.json`,
  * and RFC-4 submissions to the endpoint a target feed names in `_submissions`. Plain Webmention, form-encoded.
@@ -363,16 +367,16 @@ export class Mentions {
   }
 
   /**
-   * Finds an item, given as feed URL plus `#<id>`, as RFC-4 does: in the feed, then along `next_url` (or RFC-7's
-   * `_pups.archive_url`) on the same host, at most 10 pages. JSON Feed only.
+   * Finds an item, given as feed URL plus `#<id>`, as RFC-4 does: in the feed, then along `next_url` (or RFC-13's
+   * `_archive.archive_url`) on the same host, at most 10 pages. JSON Feed only.
    * @throws {PupsError} `network`, `not_found` or `invalid_feed` if the first feed can't be read.
    */
   async findItem(ref: string, options: { signal?: AbortSignal; item?: boolean } = {}): Promise<FoundItem> {
     const [url, id] = splitRef(ref)
     const first = await this.#readFeed(url, options.signal)
-    // An RFC-7 archive takes its _submissions from its feed file (RFC-7 "Receiving comments").
+    // An RFC-13 archive takes its _submissions from its feed file (RFC-7 "Receiving comments").
     let owner = first
-    const updates = isObject(first.doc._pups) ? first.doc._pups.updates_url : undefined
+    const updates = archiveField(first.doc, 'updates_url')
     if (typeof updates == 'string') {
       const feedUrl = new URL(updates, first.url)
       owner = feedUrl.host == new URL(first.url).host ? await this.#readFeed(feedUrl.href, options.signal).catch(() => ({ url: feedUrl.href, doc: {} })) : { url: feedUrl.href, doc: {} }
@@ -390,7 +394,7 @@ export class Mentions {
         const author = accountHost(socialspec(item)) ?? (submissions ? undefined : accountHost(socialspec(owner.doc)))
         return { ...result, item, ...author ? { author } : {} }
       }
-      const next: unknown = feed.doc.next_url ?? (isObject(feed.doc._pups) ? feed.doc._pups.archive_url : undefined)
+      const next: unknown = feed.doc.next_url ?? archiveField(feed.doc, 'archive_url')
       if (typeof next != 'string') break
       const nextUrl: URL = new URL(next, feed.url)
       if (nextUrl.host != new URL(url).host || seen.has(nextUrl.href)) break

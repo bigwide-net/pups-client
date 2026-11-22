@@ -138,7 +138,7 @@ describe('notifyAll', () => {
   it('finds the answered item in the archives, and takes the feed’s account only if the feed has no _submissions', async () => {
     const web = createWeb()
     const bob = web.receiver('bob.example')
-    web.feed('https://bob.example/feed.json', [], { _source: { accounts: { socialspec: '@bob.example' } }, _pups: { archive_url: 'https://bob.example/feed/feed.000001.json' } })
+    web.feed('https://bob.example/feed.json', [], { _source: { accounts: { socialspec: '@bob.example' } }, _archive: { archive_url: 'https://bob.example/feed/feed.000001.json' } })
     web.feed('https://bob.example/feed/feed.000001.json', [], { next_url: 'https://bob.example/feed/feed.000000.json' })
     web.feed('https://bob.example/feed/feed.000000.json', [{ id: 'old', content_text: 'Old' }])
     const item = { id: 'p1', content_text: 'Re', ...by('@tim.example.com', { inReplyTo: 'https://bob.example/feed.json#old' }) } as FeedItem

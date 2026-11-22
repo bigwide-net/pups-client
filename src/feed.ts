@@ -19,6 +19,9 @@ export const POST_URL_TEMPLATE = 'https://bigwide.net/ns/post-url-template'
 /** The `about` of the `_pups` object: RFC-7. Not its final location; readers must not rely on it. */
 export const PUPS_FEED_SPEC = 'https://github.com/bigwide-net/RFCs/blob/main/RFC-7-Feed-Publishing-with-PUPS.md'
 
+/** The `about` of the `_archive` object: RFC-13 (JSON Feed Archives). Not its final location either. */
+export const ARCHIVE_SPEC = 'https://github.com/bigwide-net/RFCs/blob/main/RFC-13-JSON-Feed-Archives.md'
+
 const RFC1_URL = 'https://github.com/bigwide-net/RFCs/blob/main/RFC-1-Source-for-JSON-Feeds.md'
 const RFC4_URL = 'https://github.com/bigwide-net/RFCs/blob/main/RFC-4-Feed-Submissions.md'
 const JSON_FEED_VERSION = 'https://jsonfeed.org/version/1.1'
@@ -27,9 +30,9 @@ const maxArchiveNumber = 999_999
 /** The feed file keeps at least this many items, also when `maxBytes` is exceeded (RFC-7 "Size in bytes"). */
 const minFeedItems = 10
 
-const mainComment = `This feed is maintained by apps through a Personal Upload Server (PUPS), following ${PUPS_FEED_SPEC}. It contains the newest items. If it has _pups.archive_url, all items are in the archives, starting with the one there.`
+const mainComment = `This feed is maintained by apps through a Personal Upload Server (PUPS), following ${PUPS_FEED_SPEC}. It contains the newest items. If it has _archive.archive_url, all items are in the archives, starting with the one there.`
 const archiveComment = (feedUrl: string) =>
-  `This is an archive of ${feedUrl}, maintained by apps through a Personal Upload Server (PUPS), following ${PUPS_FEED_SPEC}. New items appear in the feed at _pups.updates_url, older ones are in the archive at next_url.`
+  `This is an archive of ${feedUrl}, maintained by apps through a Personal Upload Server (PUPS), following ${PUPS_FEED_SPEC}. New items appear in the feed at _archive.updates_url, older ones are in the archive at next_url.`
 
 /** Feed names (RFC-7 "Named feeds"): 1 to 40 lowercase letters, digits and `-`, not starting or ending with `-`. */
 const feedNamePattern = /^[a-z0-9](?:[a-z0-9-]{0,38}[a-z0-9])?$/
@@ -38,7 +41,7 @@ const feedNamePattern = /^[a-z0-9](?:[a-z0-9-]{0,38}[a-z0-9])?$/
 const mainMediaFolders = ['images', 'media']
 
 /** Top-level fields that are fixed or managed by RFC-7, and can't be set through `create()` or `updateSettings()`. */
-const reservedFields = new Set(['version', 'home_page_url', 'feed_url', 'user_comment', 'next_url', 'items', 'hubs', '_pups', 'icon', 'favicon'])
+const reservedFields = new Set(['version', 'home_page_url', 'feed_url', 'user_comment', 'next_url', 'items', 'hubs', '_pups', '_archive', 'icon', 'favicon'])
 
 export interface FeedAuthor {
   name?: string
@@ -73,28 +76,43 @@ export interface FeedItem {
   tags?: string[]
   language?: string
   attachments?: FeedAttachment[]
-  /** The item's `_pups` object, with its index (RFC-7 "Indexes"). */
-  _pups?: ItemMarker
+  /** The item's `_archive` object, with its index (RFC-13 "Indexes"). */
+  _archive?: ItemArchive
   [field: string]: unknown
 }
 
-/** The `_pups` object of an item. */
-export interface ItemMarker {
-  /** The item's index: 0 for a feed's first item, then counting up; never changed, never used again (RFC-7 "Indexes"). */
+/** The `_archive` object of an item (RFC-13). */
+export interface ItemArchive {
+  /** The item's index: 0 for a feed's first item, then counting up; never changed, never used again (RFC-13 "Indexes"). */
   index?: number
   [field: string]: unknown
 }
 
-/** The `_pups` object of a feed file or archive. */
+/** @deprecated The index moved from `_pups` to `_archive` (RFC-13): use ItemArchive. */
+export type ItemMarker = ItemArchive
+
+/** The `_pups` object of a feed file or archive: the marker of RFC-7. */
 export interface PupsMarker {
   about?: string
   pupsControlled?: boolean
+  [field: string]: unknown
+}
+
+/** The `_archive` object of a feed file or archive (RFC-13). */
+export interface ArchiveFields {
+  about?: string
   /** In the feed file: the public URL of the newest archive. */
   archive_url?: string
+  /** In the feed file: the URL of every archive, with `{number}` for its six-digit number. */
+  archive_template?: string
+  /** In the feed file: the most items an archive holds. */
+  archive_size?: number
   /** In an archive: the public URL of the feed file, which readers poll. */
   updates_url?: string
+  /** In an archive: its number, from 0 for the oldest. */
+  number?: number
   /**
-   * The index the next new item gets (RFC-7 "Indexes"). Valid in the newest archive, or in the feed file of a feed
+   * The index the next new item gets (RFC-13 "Indexes"). Valid in the newest archive, or in the feed file of a feed
    * without archives.
    */
   next_index?: number
@@ -118,6 +136,7 @@ export interface FeedDocument {
   hubs?: unknown[]
   items: FeedItem[]
   _pups?: PupsMarker
+  _archive?: ArchiveFields
   [field: string]: unknown
 }
 
@@ -343,13 +362,42 @@ function mergeItems(existing: FeedItem[], incoming: FeedItem[]): FeedItem[] {
   return [...incoming.filter(item => !present.has(item.id)), ...existing.map(item => byId.get(item.id) ?? item)]
 }
 
-/** The index of an item (RFC-7 "Indexes"), or undefined if it has none. */
+/** The index of an item (RFC-13 "Indexes"), also from `_pups` of earlier drafts, or undefined if it has none. */
 export function itemIndex(item: FeedItem): number | undefined {
-  const index = isObject(item._pups) ? item._pups.index : undefined
+  const index = isObject(item._archive) && item._archive.index !== undefined ? item._archive.index : isObject(item._pups) ? item._pups.index : undefined
   return typeof index == 'number' && Number.isSafeInteger(index) && index >= 0 ? index : undefined
 }
 
-const withIndex = (item: FeedItem, index: number): FeedItem => ({ ...item, _pups: { ...isObject(item._pups) ? item._pups : {}, index } })
+const withIndex = (item: FeedItem, index: number): FeedItem => ({ ...item, _archive: { ...isObject(item._archive) ? item._archive : {}, index } })
+
+/** The fields of RFC-13 that earlier drafts of RFC-7 kept in `_pups`. */
+const legacyArchiveFields = ['archive_url', 'updates_url', 'next_index'] as const
+
+/**
+ * Moves the fields that earlier drafts kept in `_pups` into `_archive` (RFC-13 "Earlier drafts"), in the file and its
+ * items, where `_archive` doesn't have them already. Changes `doc`.
+ */
+function upgradeArchiveFields(doc: FeedDocument): FeedDocument {
+  const move = (from: Record<string, unknown>, to: Record<string, unknown>, keys: readonly string[]) => {
+    for (const key of keys) if (key in from) {
+      if (to[key] === undefined) to[key] = from[key]
+      delete from[key]
+    }
+  }
+  if (isObject(doc._pups) && legacyArchiveFields.some(key => key in doc._pups!)) {
+    const archive: ArchiveFields = { about: ARCHIVE_SPEC, ...isObject(doc._archive) ? doc._archive : {} }
+    move(doc._pups, archive, legacyArchiveFields)
+    doc._archive = archive
+  }
+  for (const item of doc.items)
+    if (isObject(item._pups) && 'index' in item._pups) {
+      const archive: ItemArchive = isObject(item._archive) ? item._archive : {}
+      move(item._pups, archive, ['index'])
+      item._archive = archive
+      if (!Object.keys(item._pups).length) delete item._pups
+    }
+  return doc
+}
 
 /** A post URL template (RFC-6 "Post URLs"): an https URL with `{index}` or `{id}`. */
 function validTemplate(template: unknown): template is string {
@@ -361,9 +409,9 @@ function validTemplate(template: unknown): template is string {
   }
 }
 
-/** The counter `_pups.next_index` of a file, if it has a valid one. */
+/** The counter `_archive.next_index` of a file, if it has a valid one. */
 function counterOf(doc: FeedDocument): number | undefined {
-  const next = doc._pups?.next_index
+  const next = doc._archive?.next_index
   return typeof next == 'number' && Number.isSafeInteger(next) && next >= 0 ? next : undefined
 }
 
@@ -653,21 +701,21 @@ export class PupsFeed {
       if (firstAttempt && main.doc.items.some(i => i.id == item.id))
         throw new PupsError('invalid_request', `The feed already has an item with the id "${item.id}".`)
       firstAttempt = false
-      const doc: FeedDocument = { ...main.doc, _pups: { ...main.doc._pups } }
-      const hasArchives = this.#archiveNumber(doc._pups!.archive_url) !== undefined
+      const doc: FeedDocument = { ...main.doc, _archive: { ...main.doc._archive } }
+      const hasArchives = this.#archiveNumber(doc._archive!.archive_url) !== undefined
       if (!hasArchives && !this.#archivesWanted) {
         // A feed without archives: the feed file is all there is, and holds the counter (RFC-7 "Posting").
         archiveUrl = this.url
         const indexed = indexItems(doc.items, nextFree(doc.items, counterOf(doc)))
         stored = withIndex(item, indexed.next)
-        doc._pups!.next_index = indexed.next + 1
+        doc._archive!.next_index = indexed.next + 1
         await this.#writeMain({ ...doc, items: this.#newestItems([stored], indexed.items, doc) }, main.etag, signal)
         return
       }
       if (!hasArchives) {
         const started = await this.#startArchives(main, signal)
         if (started) {
-          doc._pups!.archive_url = started.url
+          doc._archive!.archive_url = started.url
           doc.items = started.items
         }
       }
@@ -675,12 +723,12 @@ export class PupsFeed {
       const added = await this.#addToArchive(main, doc, item, signal, template)
       archiveUrl = added.url
       stored = added.item
-      doc._pups!.archive_url = added.url
+      doc._archive!.archive_url = added.url
       if (!hasArchives) {
         // The old chain of a handed-over feed now continues behind the oldest archive, and the newest archive
         // holds the counter.
         delete doc.next_url
-        delete doc._pups!.next_index
+        delete doc._archive!.next_index
       }
       doc.items = this.#newestItems(added.recent, doc.items, doc)
       await this.#writeMain(doc, main.etag, signal)
@@ -697,11 +745,11 @@ export class PupsFeed {
     const signal = options.signal
     await this.#transaction(async () => {
       const main = await this.#readControlled(this.path, signal)
-      const newest = this.#archiveNumber(main.doc._pups?.archive_url)
+      const newest = this.#archiveNumber(main.doc._archive?.archive_url)
       if (newest === undefined) {
         const indexed = indexItems(main.doc.items, nextFree(main.doc.items, counterOf(main.doc)))
         if (indexed.changed || counterOf(main.doc) !== indexed.next)
-          await this.#writeMain({ ...main.doc, items: indexed.items, _pups: { ...main.doc._pups, next_index: indexed.next } }, main.etag, signal)
+          await this.#writeMain({ ...main.doc, items: indexed.items, _archive: { ...main.doc._archive, next_index: indexed.next } }, main.etag, signal)
         return
       }
       const archive = await this.#readArchive(this.#archivePath(newest), signal)
@@ -721,7 +769,7 @@ export class PupsFeed {
   }
 
   /**
-   * All posts, newest first: the archives from `_pups.archive_url` along `next_url` (for a feed without archives,
+   * All posts, newest first: the archives from `_archive.archive_url` along `next_url` (for a feed without archives,
    * the feed file and its `next_url` chain). Each post is returned once.
    */
   async *posts(options: Signal = {}): AsyncGenerator<FeedItem> {
@@ -762,7 +810,7 @@ export class PupsFeed {
       // The index never changes (RFC-7 "Indexes").
       if (oldIndex !== undefined) item = withIndex(item, oldIndex)
       // A post of a feed with archives that never had a url may get one (RFC-7 "Post URLs").
-      if (oldIndex !== undefined && !old.url && !item.url && this.#archiveNumber(main.doc._pups?.archive_url) !== undefined)
+      if (oldIndex !== undefined && !old.url && !item.url && this.#archiveNumber(main.doc._archive?.archive_url) !== undefined)
         item = this.#withPostUrl(item, oldIndex, await this.#postUrlTemplate(signal))
       if (file != main) await this.#writeArchive(file, replaceAt(file.doc.items, index, item), signal)
       const mainIndex = main.doc.items.findIndex(i => i.id == id)
@@ -904,7 +952,7 @@ export class PupsFeed {
       // Not JSON: handled below.
     }
     if (!isFeedDocument(doc)) throw new PupsError('invalid_feed', `${path} is not a JSON Feed.`)
-    return { path, doc, etag: file.etag }
+    return { path, doc: upgradeArchiveFields(doc), etag: file.etag }
   }
 
   /** Reads a file that must exist and carry the `_pups` marker. */
@@ -917,13 +965,13 @@ export class PupsFeed {
   }
 
   /**
-   * The files that hold all items: the archives from `_pups.archive_url` along `next_url`, as far as they are files
+   * The files that hold all items: the archives from `_archive.archive_url` along `next_url`, as far as they are files
    * on this server. A feed without archives yet (handed over, not posted to) holds its items in the feed file and
    * the pages its `next_url` names.
    */
   async *#chain(main: Loaded, signal?: AbortSignal): AsyncGenerator<Loaded> {
     const visited = new Set<string>([main.path])
-    const archive = main.doc._pups?.archive_url
+    const archive = main.doc._archive?.archive_url
     let file: Loaded | undefined = main
     let next = archive && this.#archiveNumber(archive) !== undefined ? archive : undefined
     if (next) file = undefined
@@ -974,8 +1022,8 @@ export class PupsFeed {
 
   /**
    * Writes the feed file. Sets the fixed fields, so that a feed the owner handed over gets them on its first write,
-   * and upgrades JSON Feed 1.0 (RFC-7 "Handing over an existing feed"). The optional `next_url` of a feed with
-   * archives is kept equal to `archive_url` (RFC-7 "Reading").
+   * and upgrades JSON Feed 1.0 (RFC-7 "Handing over an existing feed"). A feed with archives gets the archive template
+   * and size of RFC-13, and its optional `next_url` is kept equal to `archive_url` (RFC-7 "Reading").
    */
   async #writeMain(doc: FeedDocument, etag: string, signal?: AbortSignal): Promise<FeedDocument> {
     const { author, ...rest } = doc
@@ -987,14 +1035,25 @@ export class PupsFeed {
       user_comment: mainComment,
     }
     if (author !== undefined && fixed.authors === undefined) fixed.authors = [author as FeedAuthor]
-    if (fixed.next_url !== undefined && this.#archiveNumber(fixed._pups?.archive_url) !== undefined) fixed.next_url = fixed._pups!.archive_url
+    const archiveUrl = fixed._archive?.archive_url
+    if (fixed._archive) fixed._archive = { about: ARCHIVE_SPEC, ...fixed._archive }
+    if (this.#archiveNumber(archiveUrl) !== undefined) {
+      fixed._archive = { ...fixed._archive, archive_template: this.#archiveTemplate(), archive_size: this.#archiveSize }
+      if (fixed.next_url !== undefined) fixed.next_url = archiveUrl
+    }
     await this.#session.replace(this.path, serialize(fixed), etag, { contentType: FEED_CONTENT_TYPE, signal })
     return fixed
   }
 
-  /** Writes an archive with `items`, and with the counter `next_index` if given. */
+  /**
+   * Writes an archive with `items`, and with the counter `next_index` if given. An archive of an earlier draft gets its
+   * `_archive` fields and comment of RFC-13 (`number`, `updates_url`).
+   */
   async #writeArchive(archive: Loaded, items: FeedItem[], signal?: AbortSignal, nextIndex?: number) {
-    const doc = nextIndex === undefined ? { ...archive.doc, items } : { ...archive.doc, items, _pups: { ...archive.doc._pups, next_index: nextIndex } }
+    const n = this.#archiveNumber(this.#session.publicUrl(archive.path))
+    const fields: ArchiveFields = { about: ARCHIVE_SPEC, ...archive.doc._archive, updates_url: this.url, ...n === undefined ? {} : { number: n } }
+    if (nextIndex !== undefined) fields.next_index = nextIndex
+    const doc: FeedDocument = { ...archive.doc, user_comment: archiveComment(this.url), items, _archive: fields }
     await this.#session.replace(archive.path, serialize(doc), archive.etag, { contentType: FEED_CONTENT_TYPE, signal })
   }
 
@@ -1021,6 +1080,11 @@ export class PupsFeed {
     return this.#session.publicUrl(this.#archivePath(n))
   }
 
+  /** `_archive.archive_template` (RFC-13): the archive URL with `{number}` for the number. */
+  #archiveTemplate() {
+    return this.#archiveUrl(0).replace(/000000\.json$/, '{number}.json')
+  }
+
   /** The number of the archive at `url`, or undefined if `url` is not an archive file of this feed. */
   #archiveNumber(url: string | undefined): number | undefined {
     const path = url && pathFromPublicUrl(this.#session.server, url)
@@ -1030,12 +1094,11 @@ export class PupsFeed {
   }
 
   /**
-   * A new archive with the feed fields of the feed file (RFC-7 "Archives"), except `_submissions`: whether a feed
-   * accepts comments is said by its feed file alone.
+   * A new archive with the feed fields of the feed file (RFC-13 "Feed fields of an archive"), except `_submissions`:
+   * whether a feed accepts comments is said by its feed file alone.
    */
   #newArchive(n: number, main: FeedDocument, items: FeedItem[], nextUrl: string | undefined, nextIndex?: number): FeedDocument {
-    const { items: _items, next_url: _next, user_comment: _comment, hubs: _hubs, author: _author, _pups, _submissions: _s, ...fields } = main
-    const { archive_url: _archive, next_index: _counter, ...marker } = _pups ?? {}
+    const { items: _items, next_url: _next, user_comment: _comment, hubs: _hubs, author: _author, _pups, _archive, _submissions: _s, ...fields } = main
     const podcast = fields._podcast
     if (isObject(podcast) && 'liveItems' in podcast) {
       const { liveItems: _live, ...rest } = podcast
@@ -1049,7 +1112,8 @@ export class PupsFeed {
       user_comment: archiveComment(this.url),
       ...nextUrl ? { next_url: nextUrl } : {},
       items,
-      _pups: { about: PUPS_FEED_SPEC, ...marker, pupsControlled: true, updates_url: this.url, ...nextIndex === undefined ? {} : { next_index: nextIndex } },
+      _pups: { about: PUPS_FEED_SPEC, ..._pups, pupsControlled: true },
+      _archive: { about: ARCHIVE_SPEC, updates_url: this.url, number: n, ...nextIndex === undefined ? {} : { next_index: nextIndex } },
     }
   }
 
@@ -1095,7 +1159,7 @@ export class PupsFeed {
         const existing = await this.#readArchive(this.#archivePath(n), signal)
         const ids = new Set(items.map(item => item.id))
         if (!existing || existing == 'foreign' || !existing.doc.items.every(item => ids.has(item.id)))
-          throw new PupsError('conflict', `${this.#archivePath(n)} exists already, but ${this.path} has no archive_url. Remove the file, or set _pups.archive_url (RFC-7, Starting the archives).`)
+          throw new PupsError('conflict', `${this.#archivePath(n)} exists already, but ${this.path} has no archive_url. Remove the file, or set _archive.archive_url (RFC-7, Starting the archives).`)
         await this.#writeArchive(existing, items, signal, nextIndex)
       }
       url = this.#archiveUrl(n)
@@ -1144,7 +1208,7 @@ export class PupsFeed {
    */
   async #addToArchive(main: Loaded, doc: FeedDocument, item: FeedItem, signal?: AbortSignal, template?: string): Promise<{ url: string; recent: FeedItem[]; item: FeedItem }> {
     const place = (index: number) => this.#withPostUrl(withIndex(item, index), index, template)
-    const newest = this.#archiveNumber(doc._pups?.archive_url)
+    const newest = this.#archiveNumber(doc._archive?.archive_url)
     let previous: FeedItem[] = []
     // The index for the item if it goes into a new archive.
     let next = nextFree(doc.items, newest === undefined ? counterOf(doc) : undefined)
@@ -1235,11 +1299,13 @@ export class PupsFeed {
     if (markdown !== undefined) this.#setMarkdown(item, markdown)
     if (item.content_html === undefined && item.content_text === undefined)
       throw new PupsError('invalid_request', 'A post needs content_html, content_text or markdown (JSON Feed requires content).')
-    // The index is given out when the item is added (RFC-7 "Indexes").
-    if (isObject(item._pups)) {
-      const { index: _index, ...marker } = item._pups
-      if (Object.keys(marker).length) item._pups = marker
-      else delete item._pups
+    // The index is given out when the item is added (RFC-13 "Indexes").
+    for (const key of ['_archive', '_pups'] as const) {
+      const value = item[key]
+      if (!isObject(value)) continue
+      const { index: _index, ...rest } = value
+      if (Object.keys(rest).length) item[key] = rest
+      else delete item[key]
     }
     return item
   }

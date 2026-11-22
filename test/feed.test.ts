@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it } from 'vitest'
 import { PupsClient } from '../src/client.js'
 import { isPupsError, type PupsErrorCode } from '../src/errors.js'
-import { FEED_REL, feedScopes, POST_URL_TEMPLATE, type FeedDocument, type PupsFeed } from '../src/feed.js'
+import { ARCHIVE_SPEC, FEED_REL, feedScopes, POST_URL_TEMPLATE, PUPS_FEED_SPEC, type FeedDocument, type PupsFeed } from '../src/feed.js'
 import type { Scope } from '../src/scopes.js'
 import { MemoryTokenStore } from '../src/store/memory-store.js'
 import { createMockServer, type MockOptions } from './mock-server.js'
@@ -150,14 +150,15 @@ describe('posting and archiving', () => {
     expect(first.url).toBe(`${origin}/feed/feed.000000.json#p1`)
     await postMany(feed, 2, 20)
     expect(ids(read(mock, '/feed/feed.000000.json'))).toEqual(range(20, 1))
-    expect(read(mock, '/feed.json')._pups!.archive_url).toBe(`${origin}/feed/feed.000000.json`)
+    expect(read(mock, '/feed.json')._archive!.archive_url).toBe(`${origin}/feed/feed.000000.json`)
 
     expect((await feed.addPost({ id: 'p21', content_text: 'Post 21' })).url).toBe(`${origin}/feed/feed.000001.json#p21`)
     await postMany(feed, 22, 45)
     const main = read(mock, '/feed.json')
     expect(ids(main)).toEqual(range(45, 16))
     expect(main.next_url).toBeUndefined()
-    expect(main._pups).toMatchObject({ pupsControlled: true, archive_url: `${origin}/feed/feed.000002.json` })
+    expect(main._pups).toEqual({ about: PUPS_FEED_SPEC, pupsControlled: true })
+    expect(main._archive).toEqual({ about: ARCHIVE_SPEC, archive_url: `${origin}/feed/feed.000002.json`, archive_template: `${origin}/feed/feed.{number}.json`, archive_size: 20 })
     expect(ids(read(mock, '/feed/feed.000000.json'))).toEqual(range(20, 1))
     expect(ids(read(mock, '/feed/feed.000001.json'))).toEqual(range(40, 21))
     const newest = read(mock, '/feed/feed.000002.json')
@@ -166,10 +167,12 @@ describe('posting and archiving', () => {
       title: 'Notes',
       feed_url: `${origin}/feed/feed.000002.json`,
       next_url: `${origin}/feed/feed.000001.json`,
-      _pups: { pupsControlled: true, updates_url: `${origin}/feed.json` },
+      _pups: { pupsControlled: true },
+      _archive: { about: ARCHIVE_SPEC, updates_url: `${origin}/feed.json`, number: 2, next_index: 45 },
       _podcast: { medium: 'podcast' },
     })
-    expect(newest._pups).not.toHaveProperty('archive_url')
+    expect(newest._archive).not.toHaveProperty('archive_url')
+    expect(read(mock, '/feed/feed.000001.json')._archive).toEqual({ about: ARCHIVE_SPEC, updates_url: `${origin}/feed.json`, number: 1, next_index: 40 })
     expect(newest._podcast).not.toHaveProperty('liveItems')
     expect(newest.user_comment).toContain(`This is an archive of ${origin}/feed.json`)
     expect(read(mock, '/feed/feed.000000.json').next_url).toBeUndefined()
@@ -240,7 +243,7 @@ describe('posting and archiving', () => {
     expect(ids(read(mock, '/feed/feed.000001.json'))).toEqual(['new', ...range(25, 21).map(id => `old-${id}`)])
     const main = read(mock, '/feed.json')
     expect(main.next_url).toBeUndefined()
-    expect(main._pups!.archive_url).toBe(`${origin}/feed/feed.000001.json`)
+    expect(main._archive!.archive_url).toBe(`${origin}/feed/feed.000001.json`)
     expect(ids(main)).toEqual(['new', ...range(25, 1).map(id => `old-${id}`)])
   })
 
@@ -252,7 +255,7 @@ describe('posting and archiving', () => {
     expect(first.url).toBe(`${origin}/feed.json#p1`)
     await postMany(simple, 2, 7)
     expect(ids(read(mock, '/feed.json'))).toEqual(range(7, 3))
-    expect(read(mock, '/feed.json')._pups).not.toHaveProperty('archive_url')
+    expect(read(mock, '/feed.json')._archive).not.toHaveProperty('archive_url')
     expect(mock.state.files.has('/feed/feed.000000.json')).toBe(false)
     await simple.editPost('p5', { title: 'Five' })
     expect(read(mock, '/feed.json').items[2]).toMatchObject({ id: 'p5', title: 'Five' })
@@ -413,10 +416,10 @@ describe('named feeds', () => {
     expect(read(mock, '/feed/photos.json').icon).toMatch(new RegExp(`^${origin}/feed/photos/images/icons/icon-[\\w-]+\\.png$`))
     for (let i = 1; i <= 5; i++) await photos.addPost({ id: `p${i}`, content_text: `${i}` })
     const doc = read(mock, '/feed/photos.json')
-    expect(doc).toMatchObject({ feed_url: `${origin}/feed/photos.json`, home_page_url: `${origin}/`, _pups: { archive_url: `${origin}/feed/photos/feed.000002.json` } })
+    expect(doc).toMatchObject({ feed_url: `${origin}/feed/photos.json`, home_page_url: `${origin}/`, _archive: { archive_url: `${origin}/feed/photos/feed.000002.json`, archive_template: `${origin}/feed/photos/feed.{number}.json` } })
     expect(ids(doc)).toEqual(['p5', 'p4', 'p3', 'p2'])
     expect(ids(read(mock, '/feed/photos/feed.000000.json'))).toEqual(['p2', 'p1'])
-    expect(read(mock, '/feed/photos/feed.000002.json')).toMatchObject({ next_url: `${origin}/feed/photos/feed.000001.json`, _pups: { updates_url: `${origin}/feed/photos.json` } })
+    expect(read(mock, '/feed/photos/feed.000002.json')).toMatchObject({ next_url: `${origin}/feed/photos/feed.000001.json`, _archive: { updates_url: `${origin}/feed/photos.json`, number: 2 } })
     expect((await photos.uploadMedia(png())).path).toMatch(/^\/feed\/photos\/images\/\d{4}\//)
   })
 
@@ -447,12 +450,12 @@ describe('named feeds', () => {
 })
 
 describe('indexes', () => {
-  const indexes = (doc: FeedDocument) => doc.items.map(item => item._pups?.index)
+  const indexes = (doc: FeedDocument) => doc.items.map(item => item._archive?.index)
   /** Removes all indexes and counters, as a feed written before RFC-7 had indexes. */
   const unindex = (mock: Mock, path: string) => {
-    const { next_index: _next, ...marker } = read(mock, path)._pups ?? {}
+    const { next_index: _next, ...archive } = read(mock, path)._archive ?? {}
     const doc = read(mock, path)
-    writeRaw(mock, path, { ...doc, _pups: marker, items: doc.items.map(({ _pups: _, ...item }) => item) })
+    writeRaw(mock, path, { ...doc, _archive: archive, items: doc.items.map(({ _archive: _, ...item }) => item) })
   }
 
   it('numbers the posts from 0, in the archives and the feed file, with the counter in the newest archive', async () => {
@@ -464,10 +467,10 @@ describe('indexes', () => {
     expect(indexes(read(mock, '/feed/feed.000000.json'))).toEqual(Array.from({ length: 20 }, (_, i) => 19 - i))
     const newest = read(mock, '/feed/feed.000001.json')
     expect(indexes(newest)).toEqual([24, 23, 22, 21, 20])
-    expect(newest._pups!.next_index).toBe(25)
+    expect(newest._archive!.next_index).toBe(25)
     const main = read(mock, '/feed.json')
     expect(indexes(main)).toEqual(Array.from({ length: 25 }, (_, i) => 24 - i))
-    expect(main._pups).not.toHaveProperty('next_index')
+    expect(main._archive).not.toHaveProperty('next_index')
     expect((await feed.getPost('p7'))!.index).toBe(6)
   })
 
@@ -478,7 +481,7 @@ describe('indexes', () => {
     await postMany(feed, 1, 3)
     await feed.deletePost('p3')
     expect((await feed.addPost({ id: 'p4', content_text: '4' })).index).toBe(3)
-    await feed.editPost('p2', { title: 'Two', _pups: null } as never)
+    await feed.editPost('p2', { title: 'Two', _archive: null } as never)
     await feed.editPost('p4', item => ({ id: item.id, content_text: 'replaced' }))
     expect(indexes(read(mock, '/feed/feed.000000.json'))).toEqual([3, 1, 0])
     expect(indexes(read(mock, '/feed.json'))).toEqual([3, 1, 0])
@@ -488,8 +491,8 @@ describe('indexes', () => {
     const { session } = await connect()
     const feed = session.feed()
     await feed.create({ title: 'Notes' })
-    const result = await feed.addPost({ content_text: 'x', _pups: { index: 99, other: 1 } })
-    expect(result.item._pups).toEqual({ index: 0, other: 1 })
+    const result = await feed.addPost({ content_text: 'x', _archive: { index: 99, other: 1 }, _pups: { index: 98 } })
+    expect([result.item._archive, result.item._pups]).toEqual([{ index: 0, other: 1 }, undefined])
   })
 
   it('keeps the counter in the feed file of a feed without archives', async () => {
@@ -499,7 +502,7 @@ describe('indexes', () => {
     await postMany(simple, 1, 5)
     const main = read(mock, '/feed.json')
     expect(indexes(main)).toEqual([4, 3, 2])
-    expect(main._pups!.next_index).toBe(5)
+    expect(main._archive!.next_index).toBe(5)
   })
 
   it('indexes a handed-over feed when it starts the archives', async () => {
@@ -509,7 +512,7 @@ describe('indexes', () => {
     expect((await session.feed().addPost({ id: 'new', content_text: 'New' })).index).toBe(25)
     expect(indexes(read(mock, '/feed/feed.000000.json'))).toEqual(Array.from({ length: 20 }, (_, i) => 19 - i))
     expect(indexes(read(mock, '/feed/feed.000001.json'))).toEqual([25, 24, 23, 22, 21, 20])
-    expect(read(mock, '/feed/feed.000001.json')._pups!.next_index).toBe(26)
+    expect(read(mock, '/feed/feed.000001.json')._archive!.next_index).toBe(26)
     expect(indexes(read(mock, '/feed.json'))).toEqual(Array.from({ length: 26 }, (_, i) => 25 - i))
   })
 
@@ -524,7 +527,7 @@ describe('indexes', () => {
     expect((await feed.addPost({ id: 'p26', content_text: '26' })).index).toBe(24)
     expect(indexes(read(mock, '/feed/feed.000000.json'))).toEqual(Array.from({ length: 19 }, (_, i) => 18 - i))
     expect(indexes(read(mock, '/feed/feed.000001.json'))).toEqual([24, 23, 22, 21, 20, 19])
-    expect(read(mock, '/feed/feed.000001.json')._pups!.next_index).toBe(25)
+    expect(read(mock, '/feed/feed.000001.json')._archive!.next_index).toBe(25)
     expect(indexes(read(mock, '/feed.json'))).toEqual(Array.from({ length: 25 }, (_, i) => 24 - i))
   })
 
@@ -542,6 +545,33 @@ describe('indexes', () => {
     expect(indexes(read(mock, '/feed.json'))).toEqual([4, 3, 2, 1, 0])
   })
 
+  it('moves the fields of earlier drafts from _pups to _archive (RFC-13 "Earlier drafts")', async () => {
+    const { mock, session } = await connect()
+    const feed = session.feed()
+    await feed.create({ title: 'Notes' })
+    await postMany(feed, 1, 21)
+    // As written before RFC-13: archive fields and indexes in _pups.
+    const legacy = (path: string) => {
+      const { _archive: { about: _a, archive_template: _t, archive_size: _s, number: _n, ...fields } = {}, ...doc } = read(mock, path)
+      writeRaw(mock, path, { ...doc, _pups: { ...doc._pups, ...fields }, items: doc.items.map(({ _archive, ...item }) => ({ ...item, _pups: _archive })) })
+    }
+    for (const path of ['/feed.json', '/feed/feed.000000.json', '/feed/feed.000001.json']) legacy(path)
+    expect(read(mock, '/feed.json')._pups).toMatchObject({ archive_url: `${origin}/feed/feed.000001.json` })
+    expect((await feed.getPost('p3'))!.index).toBe(2)
+
+    expect((await feed.addPost({ id: 'p22', content_text: '22' })).index).toBe(21)
+    const main = read(mock, '/feed.json')
+    expect([main._pups, main._archive?.archive_url, main.items[1]]).toEqual([{ about: PUPS_FEED_SPEC, pupsControlled: true },
+      `${origin}/feed/feed.000001.json`, { id: 'p21', content_text: 'Post 21', date_published: expect.any(String), _archive: { index: 20 } }])
+    const newest = read(mock, '/feed/feed.000001.json')
+    expect([newest._pups, newest._archive, indexes(newest)]).toEqual([{ about: PUPS_FEED_SPEC, pupsControlled: true },
+      { about: ARCHIVE_SPEC, updates_url: `${origin}/feed.json`, number: 1, next_index: 22 }, [21, 20]])
+    expect(newest.user_comment).toContain('_archive.updates_url')
+    await feed.editPost('p1', { title: 'One' })
+    expect(read(mock, '/feed/feed.000000.json')._archive).toMatchObject({ number: 0, updates_url: `${origin}/feed.json` })
+    expect(read(mock, '/feed/feed.000000.json').items.at(-1)).toMatchObject({ id: 'p1', _archive: { index: 0 } })
+  })
+
   it('indexes a feed without posting', async () => {
     const { mock, session } = await connect()
     const feed = session.feed(undefined, { archiveSize: 2 })
@@ -550,7 +580,7 @@ describe('indexes', () => {
     for (const path of ['/feed.json', '/feed/feed.000000.json', '/feed/feed.000001.json', '/feed/feed.000002.json']) unindex(mock, path)
     await feed.assignIndexes()
     expect(indexes(read(mock, '/feed/feed.000002.json'))).toEqual([4])
-    expect(read(mock, '/feed/feed.000002.json')._pups!.next_index).toBe(5)
+    expect(read(mock, '/feed/feed.000002.json')._archive!.next_index).toBe(5)
     expect(indexes(read(mock, '/feed/feed.000000.json'))).toEqual([1, 0])
     expect(indexes(read(mock, '/feed.json'))).toEqual([4, 3, 2, 1, 0])
     const etag = mock.state.files.get('/feed.json')!.etag
