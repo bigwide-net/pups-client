@@ -126,7 +126,7 @@ export async function errorFromResponse(response: Response, what: string): Promi
   const serverMessage = typeof body.message == 'string' ? body.message : undefined
   const code: PupsErrorCode = status == 400
     ? serverError == 'invalid_path' ? 'invalid_path' : 'invalid_request'
-    : statusCodes[status] ?? 'server_error'
+    : serverError == 'not_pups_controlled' ? serverError : statusCodes[status] ?? 'server_error'
   const retryAfterHeader = Number(response.headers.get('Retry-After'))
   return new PupsError(code, `${what} failed with HTTP ${status}${serverMessage ? `: ${serverMessage}` : ''}`, {
     status,

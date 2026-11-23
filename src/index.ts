@@ -32,7 +32,6 @@ export type {
   FeedSetup,
   FeedState,
   ItemArchive,
-  ItemMarker,
   MentionChoice,
   MediaInput,
   MediaResult,

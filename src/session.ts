@@ -328,6 +328,20 @@ export class PupsSession {
   }
 
   /**
+   * Sends a JSON value with POST to a file at `storage_base` (through the POST fallback with `method=POST`, if the
+   * server declares one): how apps send single items to a kept feed (RFC-7 "Posting items").
+   * @returns the status and the JSON body of the response.
+   */
+  async post(path: string, value: JsonBody, options: { signal?: AbortSignal } = {}): Promise<{ status: number; body: unknown }> {
+    const absolute = this.#checkWritable(path)
+    const data = new TextEncoder().encode(JSON.stringify(value))
+    if (data.byteLength > this.server.maxUploadBytes)
+      throw new PupsError('too_large', `The request has ${data.byteLength} bytes; the server accepts at most ${this.server.maxUploadBytes}.`)
+    const response = await this.#write('POST', absolute, { 'Content-Type': 'application/json' }, data, options.signal)
+    return { status: response.status, body: await response.json() }
+  }
+
+  /**
    * Deletes a file, if `ifMatch` is given only if it is unchanged since that ETag.
    * @throws {PupsError} `not_found` if the file doesn't exist; `precondition_failed` if it changed.
    */
@@ -438,7 +452,7 @@ export class PupsSession {
   }
 
   /** Sends a write to `storage_base`, or through the POST fallback if the server declares `post_endpoint`. */
-  async #write(method: 'PUT' | 'DELETE', path: string, headers: Record<string, string>, body: Blob | Uint8Array<ArrayBuffer> | undefined, signal?: AbortSignal) {
+  async #write(method: 'PUT' | 'DELETE' | 'POST', path: string, headers: Record<string, string>, body: Blob | Uint8Array<ArrayBuffer> | undefined, signal?: AbortSignal) {
     const { postEndpoint } = this.server
     const url = postEndpoint
       ? `${postEndpoint}${postEndpoint.includes('?') ? '&' : '?'}method=${method}&path=${encodeURIComponent(path)}`

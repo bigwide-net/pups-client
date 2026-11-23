@@ -1,9 +1,11 @@
 import { sha256Base64url } from '../src/util.js'
+import { archiveOwner, HttpError, isFeed, isFeedPath, isKept, KeptFeed, type KeptEnv } from './mock-feeds.js'
 
 /**
  * An in-memory PUPS server for tests, as a `fetch` function. Implements discovery, the authorization code flow
  * (consent is simulated by `authorize()`), refresh with rotation, reuse detection and the grace period, revocation,
- * the upload API (or the POST fallback), private files (RFC-6 "Private areas") and the host-meta endpoint.
+ * the upload API (or the POST fallback), private files (RFC-6 "Private areas"), the host-meta endpoint, and kept feeds
+ * (RFC-7, see mock-feeds.ts).
  */
 export interface MockOptions {
   domain?: string
@@ -15,6 +17,8 @@ export interface MockOptions {
   expiresIn?: number
   graceMs?: number
   maxUploadBytes?: number
+  /** Whether the server keeps feeds with the _pups marker (`kept_feeds`). Default true. */
+  keptFeeds?: boolean
 }
 
 interface Pair { refresh: string; access: string; used: boolean }
@@ -53,6 +57,7 @@ export function createMockServer(options: MockOptions = {}) {
     ...options.hostMetaEndpoint ?? true ? { host_meta_endpoint: `${origin}/pups/host-meta` } : {},
     ...options.postFallback ? { post_endpoint: `${origin}/pups/post` } : {},
     ...options.commentEndpoint ? { comment_endpoint: `${origin}/pups/comments` } : {},
+    ...options.keptFeeds ?? true ? { kept_feeds: true } : {},
     max_upload_bytes: options.maxUploadBytes ?? 1000,
     spec_version: '0.1',
   }
@@ -157,11 +162,66 @@ export function createMockServer(options: MockOptions = {}) {
     return json(400, { error: 'unsupported_grant_type' })
   }
 
+  const keptEnv: KeptEnv = {
+    read(path) {
+      const file = files.get(path)
+      try {
+        const doc: unknown = file && JSON.parse(new TextDecoder().decode(file.body))
+        return isFeed(doc) ? doc : undefined
+      } catch {
+        return undefined
+      }
+    },
+    write(path, doc) {
+      files.set(path, { body: new TextEncoder().encode(JSON.stringify(doc, null, 2)), type: 'application/json', etag: `"v${++etagCounter}"` })
+    },
+    publicUrl: path => path == '/feed.json' || path.startsWith('/feed/') ? `${origin}${path}` : `${origin}/files${path}`,
+    me: `${origin}/`,
+  }
+  const kept = options.keptFeeds ?? true
+  const keptError = (e: unknown) => {
+    if (e instanceof HttpError) return apiError(e.status, e.code)
+    throw e
+  }
+
+  /** POST of an item to a kept feed (RFC-7 "Posting items"). */
+  function postItem(path: string, body: Uint8Array, auth: string | null): Response {
+    const grant = auth?.startsWith('Bearer ') ? grantForAccess(auth.slice(7)) : undefined
+    if (!grant) return apiError(401, 'invalid_token')
+    if (!covers(grant.scopes, path)) return apiError(403, 'insufficient_scope')
+    if (!kept || !isFeedPath(path)) return apiError(404, 'not_found')
+    let item: Record<string, any>
+    try {
+      item = JSON.parse(new TextDecoder().decode(body))
+    } catch {
+      return apiError(400, 'invalid_request')
+    }
+    const stored = keptEnv.read(path)
+    if (!stored) return apiError(404, 'not_found')
+    if (!isKept(stored)) return apiError(409, 'not_pups_controlled')
+    try {
+      const feed = new KeptFeed(keptEnv, path, stored)
+      if (item._pups?.delete === true) {
+        const deleted = feed.delete(item.id, item._archive?.index)
+        if (!deleted) return apiError(404, 'not_found')
+        feed.commit()
+        return json(200, deleted)
+      }
+      const r = feed.put(item)
+      if (r.changed) feed.commit()
+      return json(r.created ? 201 : 200, { item: r.item, address: r.address }, r.created ? { Location: r.address } : {})
+    } catch (e) {
+      return keptError(e)
+    }
+  }
+
   function write(method: string, path: string, headers: Headers, body: Uint8Array | undefined, auth: string | null): Response {
     const grant = auth?.startsWith('Bearer ') ? grantForAccess(auth.slice(7)) : undefined
     if (!grant) return apiError(401, 'invalid_token')
     if (path.split('/').some(s => s == '..' || s == '.')) return apiError(400, 'invalid_path')
     if (!covers(grant.scopes, path)) return apiError(403, 'insufficient_scope')
+    const owner = kept && archiveOwner(path)
+    if (owner && isKept(keptEnv.read(owner))) return apiError(403, 'forbidden')
     const existing = files.get(path)
     const ifMatch = headers.get('If-Match')
     if (ifMatch && ifMatch != existing?.etag) return apiError(412, 'precondition_failed')
@@ -172,6 +232,21 @@ export function createMockServer(options: MockOptions = {}) {
     }
     if (headers.get('If-None-Match') == '*' && existing) return apiError(412, 'precondition_failed')
     if (body!.byteLength > config.max_upload_bytes) return apiError(413, 'too_large')
+    let parsed: unknown
+    try {
+      parsed = kept && isFeedPath(path) ? JSON.parse(new TextDecoder().decode(body)) : undefined
+    } catch {
+      // Not JSON: an ordinary file.
+    }
+    if (isKept(parsed))
+      try {
+        if (!isFeed(parsed)) return apiError(400, 'invalid_request')
+        const feed = new KeptFeed(keptEnv, path, existing ? keptEnv.read(path) : undefined)
+        feed.apply(parsed)
+        return json(existing ? 200 : 201, feed.commit(), { 'Content-Location': `${origin}/files${path}` })
+      } catch (e) {
+        return keptError(e)
+      }
     const etag = `"v${++etagCounter}"`
     files.set(path, { body: body!, type: headers.get('Content-Type') ?? '', etag })
     return new Response(null, { status: existing ? 200 : 201, headers: { ETag: etag } })
@@ -218,6 +293,7 @@ export function createMockServer(options: MockOptions = {}) {
     if (path == '/pups/post' && options.postFallback) {
       const target = url.searchParams.get('path') ?? ''
       const body = new Uint8Array(await request.arrayBuffer())
+      if (url.searchParams.get('method') == 'POST') return postItem(target, body, request.headers.get('Authorization'))
       return write(url.searchParams.get('method')!, target, request.headers, body, request.headers.get('Authorization'))
     }
     if (path.startsWith('/files/')) {
@@ -240,6 +316,7 @@ export function createMockServer(options: MockOptions = {}) {
         return new Response(file.body.slice(), { status: 200, headers: { ETag: file.etag, 'Content-Type': file.type, 'Cache-Control': cacheControl, Vary: 'Authorization' } })
       }
       if (options.postFallback) return new Response('blocked by WAF', { status: 405 })
+      if (request.method == 'POST') return postItem(filePath, new Uint8Array(await request.arrayBuffer()), request.headers.get('Authorization'))
       const body = request.method == 'PUT' ? new Uint8Array(await request.arrayBuffer()) : undefined
       return write(request.method, filePath, request.headers, body, request.headers.get('Authorization'))
     }

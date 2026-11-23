@@ -151,9 +151,8 @@ function splitRef(ref: string): [string, string | undefined] {
   return [ref.slice(0, at), id]
 }
 
-/** A field of a feed's RFC-13 `_archive`, or of `_pups` in feeds of earlier drafts (RFC-13 "Earlier drafts"). */
-const archiveField = (doc: Record<string, unknown>, key: string): unknown =>
-  (isObject(doc._archive) ? doc._archive[key] : undefined) ?? (isObject(doc._pups) ? doc._pups[key] : undefined)
+/** A field of a feed's RFC-13 `_archive`. */
+const archiveField = (doc: Record<string, unknown>, key: string): unknown => isObject(doc._archive) ? doc._archive[key] : undefined
 
 /**
  * Sends webmentions: RFC-11 mentions to the domains a post names or answers, found through their `host-meta.json`,

@@ -182,7 +182,7 @@ describe('RFC-4 submissions', () => {
   it('takes the _submissions of an RFC-7 archive from its feed file', async () => {
     const web = createWeb()
     web.feed('https://bob.example/feed.json', [], { _submissions: { url: 'https://bob.example/pups/comments', republish: 'no' } })
-    web.feed('https://bob.example/feed/feed.000000.json', [{ id: 'b1', content_text: 'Old' }], { _pups: { updates_url: 'https://bob.example/feed.json' }, _submissions: { url: 'https://stale.example/m' } })
+    web.feed('https://bob.example/feed/feed.000000.json', [{ id: 'b1', content_text: 'Old' }], { _archive: { updates_url: 'https://bob.example/feed.json' }, _submissions: { url: 'https://stale.example/m' } })
     expect((await quick(web).findItem('https://bob.example/feed/feed.000000.json#b1')).submissions).toEqual({ url: 'https://bob.example/pups/comments', republish: 'no' })
   })
 })

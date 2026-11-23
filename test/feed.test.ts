@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it } from 'vitest'
 import { PupsClient } from '../src/client.js'
 import { isPupsError, type PupsErrorCode } from '../src/errors.js'
-import { ARCHIVE_SPEC, FEED_REL, feedScopes, POST_URL_TEMPLATE, PUPS_FEED_SPEC, type FeedDocument, type PupsFeed } from '../src/feed.js'
+import { ARCHIVE_SPEC, FEED_REL, feedScopes, PUPS_FEED_SPEC, type FeedDocument, type PupsFeed } from '../src/feed.js'
 import type { Scope } from '../src/scopes.js'
 import { MemoryTokenStore } from '../src/store/memory-store.js'
 import { createMockServer, type MockOptions } from './mock-server.js'
@@ -75,7 +75,6 @@ describe('setting up a feed', () => {
     expect(doc.user_comment).toContain('Personal Upload Server (PUPS)')
     expect(doc.icon).toMatch(/^https:\/\/tim\.example\.com\/feed\/images\/icons\/icon-[\w-]+\.png$/)
     expect(mock.state.files.has(new URL(doc.icon!).pathname)).toBe(true)
-    expect(mock.state.files.get('/feed.json')!.type).toContain('application/feed+json')
     expect(mock.state.hostMeta.links).toContainEqual(expect.objectContaining({ rel: FEED_REL, href: `${origin}/feed.json` }))
     expect((await feed.load()).status).toBe('pups')
   })
@@ -141,41 +140,25 @@ describe('feeds maintained by other means', () => {
   })
 })
 
-describe('posting and archiving', () => {
-  it('adds every post to the newest archive and to the feed file, which keeps the newest 30', async () => {
+describe('posting', () => {
+  it('sends posts to the server, which archives them and keeps the newest 30 in the feed file', async () => {
     const { mock, session } = await connect()
     const feed = session.feed()
     await feed.create({ title: 'Notes', _podcast: { medium: 'podcast', liveItems: [] } })
     const first = await feed.addPost({ id: 'p1', content_text: 'Post 1' })
-    expect(first.url).toBe(`${origin}/feed/feed.000000.json#p1`)
+    expect(first).toMatchObject({ id: 'p1', index: 0, url: `${origin}/feed/feed.000000.json#p1`, item: { content_text: 'Post 1', _archive: { index: 0 } } })
+    expect(mock.state.requests.at(-1)).toEqual({ method: 'POST', url: `${origin}/files/feed.json` })
     await postMany(feed, 2, 20)
-    expect(ids(read(mock, '/feed/feed.000000.json'))).toEqual(range(20, 1))
-    expect(read(mock, '/feed.json')._archive!.archive_url).toBe(`${origin}/feed/feed.000000.json`)
-
     expect((await feed.addPost({ id: 'p21', content_text: 'Post 21' })).url).toBe(`${origin}/feed/feed.000001.json#p21`)
     await postMany(feed, 22, 45)
     const main = read(mock, '/feed.json')
     expect(ids(main)).toEqual(range(45, 16))
-    expect(main.next_url).toBeUndefined()
     expect(main._pups).toEqual({ about: PUPS_FEED_SPEC, pupsControlled: true })
     expect(main._archive).toEqual({ about: ARCHIVE_SPEC, archive_url: `${origin}/feed/feed.000002.json`, archive_template: `${origin}/feed/feed.{number}.json`, archive_size: 20 })
-    expect(ids(read(mock, '/feed/feed.000000.json'))).toEqual(range(20, 1))
     expect(ids(read(mock, '/feed/feed.000001.json'))).toEqual(range(40, 21))
     const newest = read(mock, '/feed/feed.000002.json')
-    expect(ids(newest)).toEqual(range(45, 41))
-    expect(newest).toMatchObject({
-      title: 'Notes',
-      feed_url: `${origin}/feed/feed.000002.json`,
-      next_url: `${origin}/feed/feed.000001.json`,
-      _pups: { pupsControlled: true },
-      _archive: { about: ARCHIVE_SPEC, updates_url: `${origin}/feed.json`, number: 2, next_index: 45 },
-      _podcast: { medium: 'podcast' },
-    })
-    expect(newest._archive).not.toHaveProperty('archive_url')
-    expect(read(mock, '/feed/feed.000001.json')._archive).toEqual({ about: ARCHIVE_SPEC, updates_url: `${origin}/feed.json`, number: 1, next_index: 40 })
+    expect(newest).toMatchObject({ next_url: `${origin}/feed/feed.000001.json`, _archive: { updates_url: `${origin}/feed.json`, number: 2, next_index: 45 }, _podcast: { medium: 'podcast' } })
     expect(newest._podcast).not.toHaveProperty('liveItems')
-    expect(newest.user_comment).toContain(`This is an archive of ${origin}/feed.json`)
-    expect(read(mock, '/feed/feed.000000.json').next_url).toBeUndefined()
     expect(await allIds(feed)).toEqual(range(45, 1))
     expect((await feed.getPost('p3'))!.url).toBe(`${origin}/feed/feed.000000.json#p3`)
   })
@@ -190,165 +173,95 @@ describe('posting and archiving', () => {
     expect(result.item).toMatchObject({ content_text: '**Hi**', date_published: '2026-11-15T10:00:00.000Z', _source: { markdown: '**Hi**' } })
     expect((await feed.addPost({ content_html: '<p>x</p>' })).item.date_published).toMatch(/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$/)
     expect(await errorCode(feed.addPost({ title: 'No content' }))).toBe('invalid_request')
-    expect(await errorCode(feed.addPost({ id: result.id, content_text: 'Duplicate' }))).toBe('invalid_request')
+  })
+
+  it('ignores an index or a delete in the input: the server gives new posts their index', async () => {
+    const { session } = await connect()
+    const feed = session.feed()
+    await feed.create({ title: 'Notes' })
+    await feed.addPost({ id: 'a', content_text: 'a' })
+    const b = await feed.addPost({ id: 'b', content_text: 'b', _archive: { index: 0, other: 1 }, _pups: { delete: true } } as never)
+    expect(b.item._archive).toEqual({ other: 1, index: 1 })
+    expect(await allIds(feed)).toEqual(['b', 'a'])
   })
 
   it('loses no post when two clients post at the same time', async () => {
     const { mock, session } = await connect()
     await session.feed().create({ title: 'Notes' })
-    const a = session.feed(undefined, { maxAttempts: 50 })
-    const b = session.feed(undefined, { maxAttempts: 50 })
+    const a = session.feed()
+    const b = session.feed()
     await Promise.all([postMany(a, 1, 25), (async () => {
       for (let i = 26; i <= 50; i++) await b.addPost({ id: `p${i}`, content_text: `Post ${i}` })
     })()])
-    const all = await allIds(a)
-    expect(all.sort()).toEqual(range(1, 50).sort())
+    expect((await allIds(a)).sort()).toEqual(range(1, 50).sort())
     expect(read(mock, '/feed.json').items).toHaveLength(30)
-    const archived = [0, 1, 2].flatMap(n => ids(read(mock, `/feed/feed.00000${n}.json`)))
-    expect(archived).toHaveLength(50)
   })
 
-  it('repairs the feed file from the newest archive after an interrupted post', async () => {
-    const { mock, session } = await connect()
+  it('needs a server that keeps feeds, and a feed that it keeps', async () => {
+    const { session } = await connect(undefined, { keptFeeds: false })
+    expect(session.server.keptFeeds).toBe(false)
+    expect(await errorCode(session.feed().create({ title: 'Notes' }))).toBe('unsupported')
+    expect(await errorCode(session.feed().addPost({ content_text: 'x' }))).toBe('unsupported')
+    const other = await connect()
+    expect(await errorCode(other.session.feed().addPost({ content_text: 'x' }))).toBe('not_found')
+  })
+
+  it('never writes the archives itself', async () => {
+    const { session } = await connect()
     const feed = session.feed()
     await feed.create({ title: 'Notes' })
-    await postMany(feed, 1, 3)
-    // A post that reached the archive, but not the feed file.
-    const archive = read(mock, '/feed/feed.000000.json')
-    writeRaw(mock, '/feed/feed.000000.json', { ...archive, items: [{ id: 'lost', content_text: 'Lost' }, ...archive.items] })
-    await feed.addPost({ id: 'p4', content_text: 'Post 4' })
-    expect(ids(read(mock, '/feed.json'))).toEqual(['p4', 'lost', 'p3', 'p2', 'p1'])
+    await feed.addPost({ id: 'p1', content_text: 'x' })
+    expect(await errorCode(session.put('/feed/feed.000000.json', { version: 'https://jsonfeed.org/version/1.1', items: [] }))).toBe('insufficient_scope')
   })
 
-  it('keeps fewer items in the feed file when the optional byte limit is reached, but at least 10', async () => {
-    const { mock, session } = await connect()
-    const feed = session.feed(undefined, { maxBytes: 4000 })
-    await feed.create({ title: 'Long posts' })
-    for (let i = 1; i <= 25; i++) await feed.addPost({ id: `p${i}`, content_text: 'x'.repeat(300) })
-    const main = read(mock, '/feed.json')
-    expect(main.items.length).toBeLessThan(25)
-    expect(main.items.length).toBeGreaterThanOrEqual(10)
-    expect(await allIds(feed)).toEqual(range(25, 1))
-  })
-
-  it('starts the archives of a handed-over feed with its items, and continues its chain', async () => {
-    const { mock, session } = await connect()
-    const old = range(25, 1).map(id => ({ id: `old-${id}`, content_text: id }))
-    writeRaw(mock, '/feed.json', { version: 'https://jsonfeed.org/version/1.1', title: 'Old', next_url: 'https://old.example/page2.json', items: old, _pups: { pupsControlled: true } })
+  it('posts through the POST fallback', async () => {
+    const { mock, session } = await connect(undefined, { postFallback: true })
     const feed = session.feed()
-    expect((await feed.addPost({ id: 'new', content_text: 'New' })).url).toBe(`${origin}/feed/feed.000001.json#new`)
-    const first = read(mock, '/feed/feed.000000.json')
-    expect(ids(first)).toEqual(range(20, 1).map(id => `old-${id}`))
-    expect(first.next_url).toBe('https://old.example/page2.json')
-    expect(ids(read(mock, '/feed/feed.000001.json'))).toEqual(['new', ...range(25, 21).map(id => `old-${id}`)])
-    const main = read(mock, '/feed.json')
-    expect(main.next_url).toBeUndefined()
-    expect(main._archive!.archive_url).toBe(`${origin}/feed/feed.000001.json`)
-    expect(ids(main)).toEqual(['new', ...range(25, 1).map(id => `old-${id}`)])
-  })
-
-  it('keeps a feed without archives when startArchives is false', async () => {
-    const { mock, session } = await connect()
-    const simple = session.feed(undefined, { startArchives: false, maxItems: 5 })
-    await simple.create({ title: 'Simple' })
-    const first = await simple.addPost({ id: 'p1', content_text: '1' })
-    expect(first.url).toBe(`${origin}/feed.json#p1`)
-    await postMany(simple, 2, 7)
-    expect(ids(read(mock, '/feed.json'))).toEqual(range(7, 3))
-    expect(read(mock, '/feed.json')._archive).not.toHaveProperty('archive_url')
-    expect(mock.state.files.has('/feed/feed.000000.json')).toBe(false)
-    await simple.editPost('p5', { title: 'Five' })
-    expect(read(mock, '/feed.json').items[2]).toMatchObject({ id: 'p5', title: 'Five' })
-    await simple.deletePost('p7')
-    expect(ids(read(mock, '/feed.json'))).toEqual(range(6, 3))
-
-    // A client that starts archives takes the feed over with the items it still has.
-    const archiving = session.feed(undefined, { maxItems: 5 })
-    expect((await archiving.addPost({ id: 'p8', content_text: '8' })).url).toBe(`${origin}/feed/feed.000000.json#p8`)
-    expect(ids(read(mock, '/feed/feed.000000.json'))).toEqual(['p8', ...range(6, 3)])
-    // From then on, the feed keeps its archives, also for clients that wouldn't start them.
-    await simple.addPost({ id: 'p9', content_text: '9' })
-    expect(ids(read(mock, '/feed/feed.000000.json'))).toEqual(['p9', 'p8', ...range(6, 3)])
-  })
-
-  it('keeps an optional next_url of the feed file pointing to the newest archive', async () => {
-    const { mock, session } = await connect()
-    const feed = session.feed(undefined, { archiveSize: 2 })
     await feed.create({ title: 'Notes' })
-    await postMany(feed, 1, 1)
-    writeRaw(mock, '/feed.json', { ...read(mock, '/feed.json'), next_url: `${origin}/feed/feed.000000.json` })
-    await postMany(feed, 2, 3)
-    expect(read(mock, '/feed.json').next_url).toBe(`${origin}/feed/feed.000001.json`)
-    expect(read(mock, '/feed/feed.000001.json').next_url).toBe(`${origin}/feed/feed.000000.json`)
-  })
-
-  it('continues the chain of a handed-over feed without items', async () => {
-    const { mock, session } = await connect()
-    writeRaw(mock, '/feed.json', { version: 'https://jsonfeed.org/version/1.1', title: 'Old', next_url: 'https://old.example/page2.json', items: [], _pups: { pupsControlled: true } })
-    await session.feed().addPost({ id: 'p1', content_text: 'Post 1' })
-    expect(read(mock, '/feed/feed.000000.json').next_url).toBe('https://old.example/page2.json')
-    expect(read(mock, '/feed.json').next_url).toBeUndefined()
+    expect((await feed.addPost({ id: 'p1', content_text: 'x' })).index).toBe(0)
+    expect(mock.state.requests.at(-1)).toEqual({ method: 'POST', url: `${origin}/pups/post?method=POST&path=%2Ffeed.json` })
   })
 })
 
 describe('editing and deleting', () => {
-  it('edits posts in their archive, and in the feed file if they are there, and sets date_modified', async () => {
+  it('edits posts in their archive, and in the feed file if they are there; they keep their index', async () => {
     const { mock, session } = await connect()
     const feed = session.feed()
     await feed.create({ title: 'Notes' })
     await postMany(feed, 1, 35)
 
     const archived = await feed.editPost('p3', { title: 'Third', markdown: '*3*' })
-    expect(archived.url).toBe(`${origin}/feed/feed.000000.json#p3`)
+    expect(archived).toMatchObject({ url: `${origin}/feed/feed.000000.json#p3`, index: 2 })
     const item = read(mock, '/feed/feed.000000.json').items.find(i => i.id == 'p3')!
-    expect(item).toMatchObject({ title: 'Third', content_text: '*3*', _source: { markdown: '*3*' } })
+    expect(item).toMatchObject({ title: 'Third', content_text: '*3*', _source: { markdown: '*3*' }, _archive: { index: 2 } })
     expect(item.date_modified).toBeDefined()
     expect(ids(read(mock, '/feed.json'))).not.toContain('p3')
 
-    await feed.editPost('p35', current => ({ ...current, content_text: 'Changed' }))
-    expect(read(mock, '/feed.json').items[0]).toMatchObject({ id: 'p35', content_text: 'Changed' })
+    await feed.editPost('p35', current => ({ ...current, content_text: 'Changed', _archive: { index: 0 } }))
+    expect(read(mock, '/feed.json').items[0]).toMatchObject({ id: 'p35', content_text: 'Changed', _archive: { index: 34 } })
     expect(read(mock, '/feed/feed.000001.json').items[0]).toMatchObject({ id: 'p35', content_text: 'Changed' })
     await feed.editPost('p34', { title: 'T' })
     await feed.editPost('p34', { title: null })
     expect(read(mock, '/feed.json').items[1]).not.toHaveProperty('title')
     expect(await errorCode(feed.editPost('p34', { content_text: null }))).toBe('invalid_request')
     expect(await errorCode(feed.editPost('nope', { title: 'x' }))).toBe('not_found')
+    const requests = mock.state.requests.length
+    expect((await feed.editPost('p34', () => undefined)).id).toBe('p34')
+    expect(mock.state.requests.slice(requests).some(r => r.method == 'POST')).toBe(false)
   })
 
-  it('deletes posts from their archive and fills the feed file up again', async () => {
+  it('deletes posts; the server fills the feed file up again, and never gives out an index again', async () => {
     const { mock, session } = await connect()
     const feed = session.feed()
     await feed.create({ title: 'Notes' })
     await postMany(feed, 1, 35)
-    await feed.deletePost('p2')
+    expect((await feed.deletePost('p2')).item).toMatchObject({ id: 'p2', content_text: 'Post 2' })
     expect(ids(read(mock, '/feed/feed.000000.json'))).toEqual([...range(20, 3), 'p1'])
     await feed.deletePost('p35')
-    expect(ids(read(mock, '/feed/feed.000001.json'))).toEqual(range(34, 21))
     expect(ids(read(mock, '/feed.json'))).toEqual(range(34, 5))
     expect(await feed.getPost('p2')).toBeUndefined()
     expect(await errorCode(feed.deletePost('p2'))).toBe('not_found')
-  })
-
-  it('never rebalances archives, and keeps an empty archive in the chain', async () => {
-    const { mock, session } = await connect()
-    const feed = session.feed(undefined, { maxItems: 4, archiveSize: 2 })
-    await feed.create({ title: 'Notes' })
-    await postMany(feed, 1, 6)
-    await feed.deletePost('p3')
-    await feed.deletePost('p4')
-    const emptied = read(mock, '/feed/feed.000001.json')
-    expect(emptied.items).toEqual([])
-    expect(emptied.next_url).toBe(`${origin}/feed/feed.000000.json`)
-    expect(ids(read(mock, '/feed/feed.000000.json'))).toEqual(['p2', 'p1'])
-    expect(ids(read(mock, '/feed/feed.000002.json'))).toEqual(['p6', 'p5'])
-    expect(ids(read(mock, '/feed.json'))).toEqual(['p6', 'p5', 'p2', 'p1'])
-    expect(await allIds(feed)).toEqual(['p6', 'p5', 'p2', 'p1'])
-    // Deleting from the newest archive leaves it in place too; the next post goes into it.
-    await feed.deletePost('p6')
-    await feed.deletePost('p5')
-    expect(read(mock, '/feed/feed.000002.json').items).toEqual([])
-    expect((await feed.addPost({ id: 'p7', content_text: '7' })).url).toBe(`${origin}/feed/feed.000002.json#p7`)
-    expect(await allIds(feed)).toEqual(['p7', 'p2', 'p1'])
+    expect((await feed.addPost({ id: 'p36', content_text: '36' })).index).toBe(35)
   })
 
   it('deletes media that only the deleted post uses', async () => {
@@ -374,15 +287,18 @@ describe('editing and deleting', () => {
 })
 
 describe('feed settings', () => {
-  it('updates the owner\'s fields and nothing else', async () => {
+  it('updates the owner\'s fields and nothing else; the server keeps the items', async () => {
     const { mock, session } = await connect()
     const feed = session.feed()
     await feed.create({ title: 'Notes', description: 'Old' })
+    await postMany(feed, 1, 21)
     writeRaw(mock, '/feed.json', { ...read(mock, '/feed.json'), _unknown: { kept: true } })
     await feed.updateSettings({ title: 'New', description: null, _podcast: { explicit: false } })
     const doc = read(mock, '/feed.json')
     expect(doc).toMatchObject({ title: 'New', _podcast: { explicit: false }, _unknown: { kept: true } })
     expect(doc).not.toHaveProperty('description')
+    expect(ids(doc)).toEqual(range(21, 1))
+    expect(doc._archive!.archive_url).toBe(`${origin}/feed/feed.000001.json`)
     expect(await errorCode(feed.updateSettings({ next_url: 'x' } as never))).toBe('invalid_request')
     expect(await errorCode(feed.updateSettings({ icon: 'x' } as never))).toBe('invalid_request')
     expect(await errorCode(feed.updateSettings({ title: null }))).toBe('invalid_request')
@@ -406,7 +322,7 @@ describe('feed settings', () => {
 describe('named feeds', () => {
   it('lives in /feed/<name>.json with its files in /feed/<name>/', async () => {
     const { mock, session } = await connect()
-    const photos = session.feed('photos', { maxItems: 4, archiveSize: 2 })
+    const photos = session.feed('photos')
     expect(photos).toMatchObject({ name: 'photos', path: '/feed/photos.json', directory: '/feed/photos/', url: `${origin}/feed/photos.json` })
     expect(() => session.feed('Photos')).toThrow(/not a valid feed name/)
     expect(() => session.feed('-x')).toThrow(/not a valid feed name/)
@@ -414,12 +330,11 @@ describe('named feeds', () => {
     expect(() => session.feed('media')).toThrow(/belong to the main feed/)
     await photos.create({ title: 'Photos', icon: png() })
     expect(read(mock, '/feed/photos.json').icon).toMatch(new RegExp(`^${origin}/feed/photos/images/icons/icon-[\\w-]+\\.png$`))
-    for (let i = 1; i <= 5; i++) await photos.addPost({ id: `p${i}`, content_text: `${i}` })
+    for (let i = 1; i <= 21; i++) await photos.addPost({ id: `p${i}`, content_text: `${i}` })
     const doc = read(mock, '/feed/photos.json')
-    expect(doc).toMatchObject({ feed_url: `${origin}/feed/photos.json`, home_page_url: `${origin}/`, _archive: { archive_url: `${origin}/feed/photos/feed.000002.json`, archive_template: `${origin}/feed/photos/feed.{number}.json` } })
-    expect(ids(doc)).toEqual(['p5', 'p4', 'p3', 'p2'])
-    expect(ids(read(mock, '/feed/photos/feed.000000.json'))).toEqual(['p2', 'p1'])
-    expect(read(mock, '/feed/photos/feed.000002.json')).toMatchObject({ next_url: `${origin}/feed/photos/feed.000001.json`, _archive: { updates_url: `${origin}/feed/photos.json`, number: 2 } })
+    expect(doc).toMatchObject({ feed_url: `${origin}/feed/photos.json`, home_page_url: `${origin}/`, _archive: { archive_url: `${origin}/feed/photos/feed.000001.json`, archive_template: `${origin}/feed/photos/feed.{number}.json` } })
+    expect(ids(read(mock, '/feed/photos/feed.000001.json'))).toEqual(['p21'])
+    expect(read(mock, '/feed/photos/feed.000001.json')).toMatchObject({ next_url: `${origin}/feed/photos/feed.000000.json`, _archive: { updates_url: `${origin}/feed/photos.json`, number: 1 } })
     expect((await photos.uploadMedia(png())).path).toMatch(/^\/feed\/photos\/images\/\d{4}\//)
   })
 
@@ -446,222 +361,6 @@ describe('named feeds', () => {
       [`${origin}/feed/photos.json`, '/feed/photos.json'],
       ['https://elsewhere.example/feed.json', undefined],
     ])
-  })
-})
-
-describe('indexes', () => {
-  const indexes = (doc: FeedDocument) => doc.items.map(item => item._archive?.index)
-  /** Removes all indexes and counters, as a feed written before RFC-7 had indexes. */
-  const unindex = (mock: Mock, path: string) => {
-    const { next_index: _next, ...archive } = read(mock, path)._archive ?? {}
-    const doc = read(mock, path)
-    writeRaw(mock, path, { ...doc, _archive: archive, items: doc.items.map(({ _archive: _, ...item }) => item) })
-  }
-
-  it('numbers the posts from 0, in the archives and the feed file, with the counter in the newest archive', async () => {
-    const { mock, session } = await connect()
-    const feed = session.feed()
-    await feed.create({ title: 'Notes' })
-    expect((await feed.addPost({ id: 'p1', content_text: '1' })).index).toBe(0)
-    await postMany(feed, 2, 25)
-    expect(indexes(read(mock, '/feed/feed.000000.json'))).toEqual(Array.from({ length: 20 }, (_, i) => 19 - i))
-    const newest = read(mock, '/feed/feed.000001.json')
-    expect(indexes(newest)).toEqual([24, 23, 22, 21, 20])
-    expect(newest._archive!.next_index).toBe(25)
-    const main = read(mock, '/feed.json')
-    expect(indexes(main)).toEqual(Array.from({ length: 25 }, (_, i) => 24 - i))
-    expect(main._archive).not.toHaveProperty('next_index')
-    expect((await feed.getPost('p7'))!.index).toBe(6)
-  })
-
-  it('never gives out an index again, and keeps it when the post is edited', async () => {
-    const { mock, session } = await connect()
-    const feed = session.feed()
-    await feed.create({ title: 'Notes' })
-    await postMany(feed, 1, 3)
-    await feed.deletePost('p3')
-    expect((await feed.addPost({ id: 'p4', content_text: '4' })).index).toBe(3)
-    await feed.editPost('p2', { title: 'Two', _archive: null } as never)
-    await feed.editPost('p4', item => ({ id: item.id, content_text: 'replaced' }))
-    expect(indexes(read(mock, '/feed/feed.000000.json'))).toEqual([3, 1, 0])
-    expect(indexes(read(mock, '/feed.json'))).toEqual([3, 1, 0])
-  })
-
-  it('ignores an index in the input', async () => {
-    const { session } = await connect()
-    const feed = session.feed()
-    await feed.create({ title: 'Notes' })
-    const result = await feed.addPost({ content_text: 'x', _archive: { index: 99, other: 1 }, _pups: { index: 98 } })
-    expect([result.item._archive, result.item._pups]).toEqual([{ index: 0, other: 1 }, undefined])
-  })
-
-  it('keeps the counter in the feed file of a feed without archives', async () => {
-    const { mock, session } = await connect()
-    const simple = session.feed(undefined, { startArchives: false, maxItems: 3 })
-    await simple.create({ title: 'Simple' })
-    await postMany(simple, 1, 5)
-    const main = read(mock, '/feed.json')
-    expect(indexes(main)).toEqual([4, 3, 2])
-    expect(main._archive!.next_index).toBe(5)
-  })
-
-  it('indexes a handed-over feed when it starts the archives', async () => {
-    const { mock, session } = await connect()
-    const old = range(25, 1).map(id => ({ id: `old-${id}`, content_text: id }))
-    writeRaw(mock, '/feed.json', { version: 'https://jsonfeed.org/version/1.1', title: 'Old', items: old, _pups: { pupsControlled: true } })
-    expect((await session.feed().addPost({ id: 'new', content_text: 'New' })).index).toBe(25)
-    expect(indexes(read(mock, '/feed/feed.000000.json'))).toEqual(Array.from({ length: 20 }, (_, i) => 19 - i))
-    expect(indexes(read(mock, '/feed/feed.000001.json'))).toEqual([25, 24, 23, 22, 21, 20])
-    expect(read(mock, '/feed/feed.000001.json')._archive!.next_index).toBe(26)
-    expect(indexes(read(mock, '/feed.json'))).toEqual(Array.from({ length: 26 }, (_, i) => 25 - i))
-  })
-
-  it('indexes an existing feed before posting to it: in the order of the archives, without gaps for deleted posts', async () => {
-    const { mock, session } = await connect()
-    const feed = session.feed()
-    await feed.create({ title: 'Notes' })
-    await postMany(feed, 1, 25)
-    await feed.deletePost('p2')
-    for (const path of ['/feed.json', '/feed/feed.000000.json', '/feed/feed.000001.json']) unindex(mock, path)
-
-    expect((await feed.addPost({ id: 'p26', content_text: '26' })).index).toBe(24)
-    expect(indexes(read(mock, '/feed/feed.000000.json'))).toEqual(Array.from({ length: 19 }, (_, i) => 18 - i))
-    expect(indexes(read(mock, '/feed/feed.000001.json'))).toEqual([24, 23, 22, 21, 20, 19])
-    expect(read(mock, '/feed/feed.000001.json')._archive!.next_index).toBe(25)
-    expect(indexes(read(mock, '/feed.json'))).toEqual(Array.from({ length: 25 }, (_, i) => 24 - i))
-  })
-
-  it('gives posts of clients without indexes theirs on the next post', async () => {
-    const { mock, session } = await connect()
-    const feed = session.feed()
-    await feed.create({ title: 'Notes' })
-    await postMany(feed, 1, 2)
-    // Another client, which doesn't know indexes, added two posts.
-    const archive = read(mock, '/feed/feed.000000.json')
-    writeRaw(mock, '/feed/feed.000000.json', { ...archive, items: [{ id: 'b', content_text: 'b' }, { id: 'a', content_text: 'a' }, ...archive.items] })
-    expect((await feed.addPost({ id: 'p3', content_text: '3' })).index).toBe(4)
-    expect(ids(read(mock, '/feed/feed.000000.json'))).toEqual(['p3', 'b', 'a', 'p2', 'p1'])
-    expect(indexes(read(mock, '/feed/feed.000000.json'))).toEqual([4, 3, 2, 1, 0])
-    expect(indexes(read(mock, '/feed.json'))).toEqual([4, 3, 2, 1, 0])
-  })
-
-  it('moves the fields of earlier drafts from _pups to _archive (RFC-13 "Earlier drafts")', async () => {
-    const { mock, session } = await connect()
-    const feed = session.feed()
-    await feed.create({ title: 'Notes' })
-    await postMany(feed, 1, 21)
-    // As written before RFC-13: archive fields and indexes in _pups.
-    const legacy = (path: string) => {
-      const { _archive: { about: _a, archive_template: _t, archive_size: _s, number: _n, ...fields } = {}, ...doc } = read(mock, path)
-      writeRaw(mock, path, { ...doc, _pups: { ...doc._pups, ...fields }, items: doc.items.map(({ _archive, ...item }) => ({ ...item, _pups: _archive })) })
-    }
-    for (const path of ['/feed.json', '/feed/feed.000000.json', '/feed/feed.000001.json']) legacy(path)
-    expect(read(mock, '/feed.json')._pups).toMatchObject({ archive_url: `${origin}/feed/feed.000001.json` })
-    expect((await feed.getPost('p3'))!.index).toBe(2)
-
-    expect((await feed.addPost({ id: 'p22', content_text: '22' })).index).toBe(21)
-    const main = read(mock, '/feed.json')
-    expect([main._pups, main._archive?.archive_url, main.items[1]]).toEqual([{ about: PUPS_FEED_SPEC, pupsControlled: true },
-      `${origin}/feed/feed.000001.json`, { id: 'p21', content_text: 'Post 21', date_published: expect.any(String), _archive: { index: 20 } }])
-    const newest = read(mock, '/feed/feed.000001.json')
-    expect([newest._pups, newest._archive, indexes(newest)]).toEqual([{ about: PUPS_FEED_SPEC, pupsControlled: true },
-      { about: ARCHIVE_SPEC, updates_url: `${origin}/feed.json`, number: 1, next_index: 22 }, [21, 20]])
-    expect(newest.user_comment).toContain('_archive.updates_url')
-    await feed.editPost('p1', { title: 'One' })
-    expect(read(mock, '/feed/feed.000000.json')._archive).toMatchObject({ number: 0, updates_url: `${origin}/feed.json` })
-    expect(read(mock, '/feed/feed.000000.json').items.at(-1)).toMatchObject({ id: 'p1', _archive: { index: 0 } })
-  })
-
-  it('indexes a feed without posting', async () => {
-    const { mock, session } = await connect()
-    const feed = session.feed(undefined, { archiveSize: 2 })
-    await feed.create({ title: 'Notes' })
-    await postMany(feed, 1, 5)
-    for (const path of ['/feed.json', '/feed/feed.000000.json', '/feed/feed.000001.json', '/feed/feed.000002.json']) unindex(mock, path)
-    await feed.assignIndexes()
-    expect(indexes(read(mock, '/feed/feed.000002.json'))).toEqual([4])
-    expect(read(mock, '/feed/feed.000002.json')._archive!.next_index).toBe(5)
-    expect(indexes(read(mock, '/feed/feed.000000.json'))).toEqual([1, 0])
-    expect(indexes(read(mock, '/feed.json'))).toEqual([4, 3, 2, 1, 0])
-    const etag = mock.state.files.get('/feed.json')!.etag
-    await feed.assignIndexes()
-    expect(mock.state.files.get('/feed.json')!.etag).toBe(etag)
-  })
-
-  it('gives every post a different index when two clients post at the same time', async () => {
-    const { mock, session } = await connect()
-    await session.feed().create({ title: 'Notes' })
-    const a = session.feed(undefined, { maxAttempts: 50 })
-    const b = session.feed(undefined, { maxAttempts: 50 })
-    await Promise.all([postMany(a, 1, 15), (async () => {
-      for (let i = 16; i <= 30; i++) await b.addPost({ id: `p${i}`, content_text: `Post ${i}` })
-    })()])
-    const archived = [0, 1].flatMap(n => indexes(read(mock, `/feed/feed.00000${n}.json`)))
-    expect([...archived].sort((x, y) => x! - y!)).toEqual(Array.from({ length: 30 }, (_, i) => i))
-  })
-})
-
-describe('post URLs', () => {
-  const template = `${origin}/p/{feed}/post/{index}`
-  const withTemplate = async (value: string = template) => {
-    const c = await connect()
-    c.mock.state.hostMeta.properties[POST_URL_TEMPLATE] = value
-    return c
-  }
-
-  it('gives posts of a feed with archives the URL of their page, in the archive and the feed file', async () => {
-    const { mock, session } = await withTemplate()
-    const feed = session.feed()
-    await feed.create({ title: 'Notes' })
-    const hostMetaReads = () => mock.state.requests.filter(r => r.url.endsWith('/.well-known/host-meta.json')).length
-    const before = hostMetaReads()
-    const post = await feed.addPost({ id: 'p0', content_text: '0' })
-    expect(post.item.url).toBe(`${origin}/p/feed/post/0`)
-    expect(post.url).toBe(`${origin}/feed/feed.000000.json#p0`)
-    await postMany(feed, 1, 21)
-    expect(read(mock, '/feed/feed.000001.json').items[0]!.url).toBe(`${origin}/p/feed/post/21`)
-    expect(read(mock, '/feed.json').items.map(item => item.url)).toEqual(Array.from({ length: 22 }, (_, i) => `${origin}/p/feed/post/${21 - i}`))
-    expect(hostMetaReads() - before).toBe(1) // the template is read once
-  })
-
-  it('fills {feed} with the feed file’s path, and {id}', async () => {
-    const { session } = await withTemplate(`${origin}/posts/{feed}/{id}.html`)
-    const feed = session.feed('photos')
-    await feed.create({ title: 'Photos' })
-    expect((await feed.addPost({ id: 'a b', content_text: 'x' })).item.url).toBe(`${origin}/posts/feed/photos/a%20b.html`)
-  })
-
-  it('keeps the url the app gives, and adds none without archives, template or wish', async () => {
-    const { mock, session } = await withTemplate()
-    const feed = session.feed()
-    await feed.create({ title: 'Notes' })
-    expect((await feed.addPost({ content_text: 'x', url: 'https://elsewhere.example/1' })).item.url).toBe('https://elsewhere.example/1')
-    expect((await session.feed(undefined, { postUrls: false }).addPost({ content_text: 'x' })).item.url).toBeUndefined()
-
-    const plain = session.feed('photos', { startArchives: false })
-    await plain.create({ title: 'Photos' })
-    expect((await plain.addPost({ content_text: 'x' })).item.url).toBeUndefined()
-
-    for (const bad of ['http://tim.example.com/p/{index}', `${origin}/p/latest`, 'javascript:{index}']) {
-      mock.state.hostMeta.properties[POST_URL_TEMPLATE] = bad
-      expect((await session.feed().addPost({ content_text: 'x' })).item.url).toBeUndefined()
-    }
-    delete mock.state.hostMeta.properties[POST_URL_TEMPLATE]
-    expect((await session.feed().addPost({ content_text: 'x' })).item.url).toBeUndefined()
-  })
-
-  it('adds the url when a post without one is edited, but never changes or restores one', async () => {
-    const { mock, session } = await connect()
-    const feed = session.feed()
-    await feed.create({ title: 'Notes' })
-    await feed.addPost({ id: 'old', content_text: 'x' })
-    await feed.addPost({ id: 'own', content_text: 'x', url: 'https://elsewhere.example/1' })
-    mock.state.hostMeta.properties[POST_URL_TEMPLATE] = template
-    const edited = session.feed()
-    expect((await edited.editPost('old', { title: 'Old' })).item.url).toBe(`${origin}/p/feed/post/0`)
-    expect(read(mock, '/feed.json').items.find(item => item.id == 'old')!.url).toBe(`${origin}/p/feed/post/0`)
-    expect((await edited.editPost('own', { title: 'Own' })).item.url).toBe('https://elsewhere.example/1')
-    expect((await edited.editPost('own', { url: null })).item.url).toBeUndefined()
   })
 })
 

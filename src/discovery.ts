@@ -48,6 +48,11 @@ export interface PupsServer {
    * (RFC-6 "Built-in receiver"). Feeds opt in with `feed.enableComments()`.
    */
   commentEndpoint?: string
+  /**
+   * Whether the server keeps feeds with the RFC-7 marker (`kept_feeds`): it writes their archives, and takes single
+   * items by POST. `PupsFeed` needs it to post.
+   */
+  keptFeeds: boolean
   maxUploadBytes: number
   specVersion: string
   /** The configuration document as fetched, including fields this library doesn't know. */
@@ -181,6 +186,7 @@ export function parseConfig(json: unknown, domain: string, identityHosts: string
     ...hostMetaEndpoint ? { hostMetaEndpoint } : {},
     ...postEndpoint ? { postEndpoint } : {},
     ...commentEndpoint ? { commentEndpoint } : {},
+    keptFeeds: raw.kept_feeds === true,
     maxUploadBytes: maxUploadBytes as number,
     specVersion,
     raw,
