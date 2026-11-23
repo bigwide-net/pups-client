@@ -30,8 +30,11 @@ const FEED_CONTENT_TYPE = 'application/feed+json'
 /** Feed names (RFC-7 "Named feeds"): 1 to 40 lowercase letters, digits and `-`, not starting or ending with `-`. */
 const feedNamePattern = /^[a-z0-9](?:[a-z0-9-]{0,38}[a-z0-9])?$/
 
-/** The main feed's media directories in `/feed/`, which therefore can't be feed names. */
+/** The main feed's media directories in `/feed/`. */
 const mainMediaFolders = ['images', 'media']
+
+/** Names in `/feed/` that belong to the main feed, its media and comment feeds, and therefore can't be feed names. */
+const reservedNames = [...mainMediaFolders, 'comments']
 
 /** Top-level fields that are fixed or managed by RFC-7, and can't be set through `create()` or `updateSettings()`. */
 const reservedFields = new Set(['version', 'home_page_url', 'feed_url', 'user_comment', 'next_url', 'items', 'hubs', '_pups', '_archive', 'icon', 'favicon'])
@@ -151,6 +154,8 @@ export interface CommentPolicy {
   requireSocialSpec?: boolean
   allowEdit?: boolean
   allowDelete?: boolean
+  commentLimit?: number
+  maxDepth?: number
   [rule: string]: unknown
 }
 
@@ -295,7 +300,7 @@ function feedPaths(name?: string): { path: `/${string}`; directory: `/${string}`
   if (name === undefined) return { path: '/feed.json', directory: '/feed/' }
   if (!feedNamePattern.test(name))
     throw new PupsError('invalid_request', `"${name}" is not a valid feed name: use 1 to 40 lowercase letters, digits and "-", not starting or ending with "-" (RFC-7, Named feeds).`)
-  if (mainMediaFolders.includes(name))
+  if (reservedNames.includes(name))
     throw new PupsError('invalid_request', `"${name}" can't be a feed name: /feed/${name}/ and its files belong to the main feed (RFC-7, Named feeds).`)
   return { path: `/feed/${name}.json`, directory: `/feed/${name}/` }
 }
@@ -512,21 +517,26 @@ export class PupsFeed {
 
   /**
    * Lets readers comment on the feed's posts through the PUPS server, which puts the comments into the owner's inbox
-   * (RFC-6 "Built-in receiver"): writes RFC-4 `_submissions` into the feed file, with `comment_endpoint` as `url`,
-   * the comments policy (RFC-4's defaults for `title`, `minLength` and `maxLength`, overridden by `policy`) and
-   * `republish: "no"`. Replaces the `_submissions` of another service; check `comments()` first and ask the owner.
-   * Single posts are closed with `_commenting: { allowComments: false }` (RFC-4).
+   * (RFC-6 "Built-in receiver"). The owner approves them there, and the server publishes them in a comment feed per
+   * post, which the post's `_source.comments` names (RFC-7 "Publishing comments"): in full, or with
+   * `republish: 'summary'` as an abstract of 150 characters that links to the comment (which then needs a `url`). With
+   * `republish: 'no'`, the owner only reads them. Writes RFC-4 `_submissions` into the feed file, with
+   * `comment_endpoint` as `url`, the comments policy (RFC-4's defaults for `title`, `minLength` and `maxLength`, and
+   * `maxDepth: 1`, since the server accepts comments on posts only, overridden by `policy`) and `republish`, by
+   * default `full`. Replaces the `_submissions` of another
+   * service; check `comments()` first and ask the owner. Single posts are closed with
+   * `_commenting: { allowComments: false }` (RFC-4).
    * @throws {PupsError} `unsupported` if the server has no `comment_endpoint`.
    */
-  async enableComments(settings: { policy?: CommentPolicy; tos?: string } = {}, options: Signal = {}): Promise<FeedDocument> {
+  async enableComments(settings: { policy?: CommentPolicy; tos?: string; republish?: 'full' | 'summary' | 'no' } = {}, options: Signal = {}): Promise<FeedDocument> {
     const url = this.#session.server.commentEndpoint
     if (!url) throw new PupsError('unsupported', 'This PUPS server doesn\'t receive comments: its configuration has no comment_endpoint (RFC-6, Built-in receiver).')
     return this.#setSubmissions({
       about: RFC4_URL,
       url,
       ...settings.tos ? { tos: settings.tos } : {},
-      policies: { comments: { title: 'none', minLength: 2, maxLength: 2000, ...settings.policy } },
-      republish: 'no',
+      policies: { comments: { title: 'none', minLength: 2, maxLength: 2000, maxDepth: 1, ...settings.policy } },
+      republish: settings.republish ?? 'full',
     }, options.signal)
   }
 
@@ -552,6 +562,8 @@ export class PupsFeed {
     const folder = (options.folder ?? (type.startsWith('image/') ? 'images' : 'media')).replace(/^\/+|\/+$/g, '')
     if (folder == 'images/icons' || folder.startsWith('images/icons/'))
       throw new PupsError('invalid_request', `${this.directory}images/icons/ is reserved for the feed's icons (RFC-7, Icons).`)
+    if (folder.split('/')[0] == 'comments')
+      throw new PupsError('invalid_request', `${this.directory}comments/ is reserved for the comment feeds that the server writes (RFC-7, Publishing comments).`)
     if (this.name === undefined && !mainMediaFolders.includes(folder.split('/')[0]!))
       throw new PupsError('invalid_request', `The main feed's media go into /feed/images/ or /feed/media/; the rest of /feed/ belongs to named feeds (RFC-7, Items).`)
     return this.#upload(media, `${folder}/${new Date().getUTCFullYear()}/`, options.signal)

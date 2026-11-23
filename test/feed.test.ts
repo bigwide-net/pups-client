@@ -281,6 +281,7 @@ describe('editing and deleting', () => {
     expect(mock.state.files.has(shared.path)).toBe(true)
     expect(await errorCode(feed.uploadMedia({ body: 'x', extension: 'html' }))).toBe('unsupported_type')
     expect(await errorCode(feed.uploadMedia(png(), { folder: 'images/icons' }))).toBe('invalid_request')
+    expect(await errorCode(session.feed('photos').uploadMedia(png(), { folder: 'comments' }))).toBe('invalid_request')
     expect(await errorCode(feed.uploadMedia(png(), { folder: 'photos' }))).toBe('invalid_request')
     expect((await feed.uploadMedia(png(), { folder: 'media/covers' })).path).toMatch(/^\/feed\/media\/covers\/\d{4}\//)
   })
@@ -328,6 +329,7 @@ describe('named feeds', () => {
     expect(() => session.feed('-x')).toThrow(/not a valid feed name/)
     expect(() => session.feed('images')).toThrow(/belong to the main feed/)
     expect(() => session.feed('media')).toThrow(/belong to the main feed/)
+    expect(() => session.feed('comments')).toThrow(/belong to the main feed/)
     await photos.create({ title: 'Photos', icon: png() })
     expect(read(mock, '/feed/photos.json').icon).toMatch(new RegExp(`^${origin}/feed/photos/images/icons/icon-[\\w-]+\\.png$`))
     for (let i = 1; i <= 21; i++) await photos.addPost({ id: `p${i}`, content_text: `${i}` })
@@ -381,10 +383,14 @@ describe('comments', () => {
       about: 'https://github.com/bigwide-net/RFCs/blob/main/RFC-4-Feed-Submissions.md',
       url: comments,
       tos: `${origin}/tos.html`,
-      policies: { comments: { title: 'none', minLength: 2, maxLength: 500, requireSocialSpec: true } },
-      republish: 'no',
+      policies: { comments: { title: 'none', minLength: 2, maxLength: 500, maxDepth: 1, requireSocialSpec: true } },
+      republish: 'full',
     })
     expect(feed.comments(doc)).toBe('pups')
+    for (const republish of ['summary', 'no'] as const) {
+      await feed.enableComments({ republish })
+      expect(read(mock, '/feed.json')._submissions).toMatchObject({ republish })
+    }
     await feed.disableComments()
     expect(read(mock, '/feed.json')).not.toHaveProperty('_submissions')
   })
@@ -396,7 +402,7 @@ describe('comments', () => {
     await feed.updateSettings({ _submissions: { url: 'https://rm.example.org/groups/tim/mention', republish: 'full' } })
     expect(feed.comments(read(mock, '/feed.json'))).toBe('other')
     await feed.enableComments()
-    expect(read(mock, '/feed.json')._submissions).toMatchObject({ url: comments, policies: { comments: { title: 'none', minLength: 2, maxLength: 2000 } } })
+    expect(read(mock, '/feed.json')._submissions).toMatchObject({ url: comments, policies: { comments: { title: 'none', minLength: 2, maxLength: 2000, maxDepth: 1 } } })
   })
 
   it('needs a server with a comment endpoint', async () => {
