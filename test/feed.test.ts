@@ -383,7 +383,7 @@ describe('comments', () => {
       about: 'https://github.com/bigwide-net/RFCs/blob/main/RFC-4-Feed-Submissions.md',
       url: comments,
       tos: `${origin}/tos.html`,
-      policies: { comments: { title: 'none', minLength: 2, maxLength: 500, maxDepth: 1, requireSocialSpec: true } },
+      policies: { comments: { title: 'none', minLength: 2, maxLength: 500, maxDepth: 5, requireSocialSpec: true } },
       republish: 'full',
     })
     expect(feed.comments(doc)).toBe('pups')
@@ -402,7 +402,7 @@ describe('comments', () => {
     await feed.updateSettings({ _submissions: { url: 'https://rm.example.org/groups/tim/mention', republish: 'full' } })
     expect(feed.comments(read(mock, '/feed.json'))).toBe('other')
     await feed.enableComments()
-    expect(read(mock, '/feed.json')._submissions).toMatchObject({ url: comments, policies: { comments: { title: 'none', minLength: 2, maxLength: 2000, maxDepth: 1 } } })
+    expect(read(mock, '/feed.json')._submissions).toMatchObject({ url: comments, policies: { comments: { title: 'none', minLength: 2, maxLength: 2000, maxDepth: 5 } } })
   })
 
   it('needs a server with a comment endpoint', async () => {

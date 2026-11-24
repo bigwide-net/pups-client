@@ -145,7 +145,8 @@ export interface FeedSettings {
 
 /**
  * The rules for comments of RFC-4 "Policies". Missing rules have RFC-4's defaults; servers may add others. The PUPS
- * server's receiver enforces `title`, `minLength`, `maxLength`, `requireSocialSpec`, `allowEdit` and `allowDelete`.
+ * server's receiver enforces `title`, `minLength`, `maxLength`, `requireSocialSpec`, `allowEdit`, `allowDelete`,
+ * `commentLimit` and `maxDepth` (at most 10).
  */
 export interface CommentPolicy {
   title?: 'required' | 'allowed' | 'none'
@@ -154,7 +155,9 @@ export interface CommentPolicy {
   requireSocialSpec?: boolean
   allowEdit?: boolean
   allowDelete?: boolean
+  /** The comments a post may have, on all levels (RFC-4 default 1000). */
   commentLimit?: number
+  /** How deep replies are nested: 1 allows comments on posts only, 2 also replies to them (RFC-4 default 5). */
   maxDepth?: number
   [rule: string]: unknown
 }
@@ -179,7 +182,7 @@ export interface FeedSetup extends FeedSettings {
   title: string
   /** 512 × 512 pixels, stored in `images/icons/` in the feed directory. */
   icon?: MediaInput
-  /** 64 × 64 pixels, stored in `images/icons/` in the feed directory. */
+  /** 192 × 192 pixels, stored in `images/icons/` in the feed directory. */
   favicon?: MediaInput
 }
 
@@ -497,7 +500,7 @@ export class PupsFeed {
     return this.#setImage('icon', media, options.signal)
   }
 
-  /** Uploads a new favicon (64 × 64) to the icons directory, like `setIcon()`, or removes it with `null`. */
+  /** Uploads a new favicon (192 × 192) to the icons directory, like `setIcon()`, or removes it with `null`. */
   setFavicon(media: MediaInput | null, options: Signal = {}): Promise<FeedDocument> {
     return this.#setImage('favicon', media, options.signal)
   }
@@ -521,9 +524,9 @@ export class PupsFeed {
    * post, which the post's `_source.comments` names (RFC-7 "Publishing comments"): in full, or with
    * `republish: 'summary'` as an abstract of 150 characters that links to the comment (which then needs a `url`). With
    * `republish: 'no'`, the owner only reads them. Writes RFC-4 `_submissions` into the feed file, with
-   * `comment_endpoint` as `url`, the comments policy (RFC-4's defaults for `title`, `minLength` and `maxLength`, and
-   * `maxDepth: 1`, since the server accepts comments on posts only, overridden by `policy`) and `republish`, by
-   * default `full`. Replaces the `_submissions` of another
+   * `comment_endpoint` as `url`, the comments policy (RFC-4's defaults for `title`, `minLength`, `maxLength` and
+   * `maxDepth`, 5 levels of replies, overridden by `policy`) and `republish`, by default `full`. Replies to comments
+   * go into comment feeds of their own, which the comment's `_source.comments` names. Replaces the `_submissions` of another
    * service; check `comments()` first and ask the owner. Single posts are closed with
    * `_commenting: { allowComments: false }` (RFC-4).
    * @throws {PupsError} `unsupported` if the server has no `comment_endpoint`.
@@ -535,7 +538,7 @@ export class PupsFeed {
       about: RFC4_URL,
       url,
       ...settings.tos ? { tos: settings.tos } : {},
-      policies: { comments: { title: 'none', minLength: 2, maxLength: 2000, maxDepth: 1, ...settings.policy } },
+      policies: { comments: { title: 'none', minLength: 2, maxLength: 2000, maxDepth: 5, ...settings.policy } },
       republish: settings.republish ?? 'full',
     }, options.signal)
   }
