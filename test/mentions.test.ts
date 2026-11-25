@@ -146,6 +146,24 @@ describe('notifyAll', () => {
     expect(web.received(bob)).toHaveLength(1)
   })
 
+  it('sends no reply mention for an item with notifyReplies false, but still the mention by name', async () => {
+    const web = createWeb()
+    const bob = web.receiver('bob.example')
+    web.feed('https://bob.example/feed.json', [
+      { id: 'b1', content_text: 'Hi', ...by('@bob.example'), _commenting: { notifyReplies: false } },
+      { id: 'b2', content_text: 'Hi again', ...by('@bob.example'), _commenting: { notifyReplies: true } },
+    ])
+    const reply = (to: string, content_text = 'Agreed') =>
+      ({ id: 'p1', content_text, ...by('@tim.example.com', { inReplyTo: `https://bob.example/feed.json#${to}` }) }) as FeedItem
+    const m = quick(web)
+    expect(await m.notifyAll({ source, item: reply('b1') })).toEqual([])
+    expect(await m.reply(source, 'https://bob.example/feed.json#b1')).toBeUndefined()
+    expect((await m.notifyAll({ source, item: reply('b1', 'Did you see this, @bob.example?') })).map(r => [r.kind, r.target])).toEqual([['mention', 'https://bob.example/']])
+    expect((await m.notifyAll({ source, item: reply('b2') })).map(r => [r.kind, r.target])).toEqual([['reply', 'https://bob.example/feed.json#b2']])
+    expect(web.received(bob)).toEqual([[source, 'https://bob.example/'], [source, 'https://bob.example/feed.json#b2']])
+    expect(await m.findItem('https://bob.example/feed.json#b1')).toMatchObject({ author: 'bob.example', notifyReplies: false })
+  })
+
   it('notifies at most 20 accounts', async () => {
     const web = createWeb()
     const hosts = Array.from({ length: 25 }, (_, i) => `h${i}.example`)

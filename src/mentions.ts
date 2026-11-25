@@ -100,6 +100,8 @@ export interface FoundItem {
   item?: FeedItem
   /** The host of the item's author (RFC-11 "Replies"): its own socialspec account, else the feed's if the feed has no `_submissions`. */
   author?: string
+  /** False if the item's author declined reply mentions, with RFC-4 `_commenting.notifyReplies: false` (RFC-11 "Opting out"). */
+  notifyReplies?: boolean
 }
 
 interface Feed {
@@ -137,6 +139,7 @@ const isHttps = (url: unknown): url is string => protocolOf(url) == 'https:'
 const isHttpUrl = (url: unknown): url is string => isHttps(url) || protocolOf(url) == 'http:'
 
 const inReplyTo = (item?: MentionSource) => isObject(item?._source) && typeof item._source.inReplyTo == 'string' ? item._source.inReplyTo : undefined
+const notifyReplies = (item: FeedItem) => !(isObject(item._commenting) && item._commenting.notifyReplies === false)
 const socialspec = (o: unknown) => isObject(o) && isObject(o._source) && isObject(o._source.accounts) ? o._source.accounts.socialspec : undefined
 const retryable = (status: number) => status == 429 || status >= 500
 
@@ -270,7 +273,7 @@ export class Mentions {
 
   /**
    * Tells the author of the item `target` (a feed URL plus `#<id>`) that `source` answers it (RFC-11 "Replies").
-   * @returns undefined if the item has no author to notify, can't be read, or its feed takes RFC-4 submissions:
+   * @returns undefined if the item has no author to notify (or says `notifyReplies: false`), can't be read, or its feed takes RFC-4 submissions:
    *   then the answer is a submission, and the RFC-4 server sends the mentions.
    */
   async reply(source: string, target: string, options: { signal?: AbortSignal; retry?: boolean } = {}): Promise<MentionReport | undefined> {
@@ -278,7 +281,7 @@ export class Mentions {
       if (isPupsError(e, 'aborted')) throw e
       return undefined
     })
-    return found?.author && !found.submissions ? this.notify(source, found.author, { ...options, target }) : undefined
+    return found?.author && found.notifyReplies && !found.submissions ? this.notify(source, found.author, { ...options, target }) : undefined
   }
 
   /**
@@ -314,7 +317,8 @@ export class Mentions {
   /**
    * The accounts a post that is added, changed or deleted would notify (RFC-11 "Who is mentioned"), without sending
    * anything, e.g. to list them in a confirmation dialog before posting: every domain its title and text name
-   * (RFC-11 "Handles"), and the author of the item it answers, with a reply. After an edit or delete, every account
+   * (RFC-11 "Handles"), and the author of the item it answers, with a reply, unless the item says `notifyReplies: false`
+   * (RFC-4 `_commenting`; mentions by name still go out). After an edit or delete, every account
    * the old or the new version mentions. Each account once, replies first, never `me`, at most 20.
    *
    * Empty if the post answers an item of a feed with RFC-4 `_submissions`: such a post is a submission, and the
@@ -334,7 +338,7 @@ export class Mentions {
         return undefined
       })
       if (found?.submissions) return []
-      if (found?.author && found.author != own && !replies.has(found.author)) replies.set(found.author, target)
+      if (found?.author && found.notifyReplies && found.author != own && !replies.has(found.author)) replies.set(found.author, target)
     }
     const names = [...new Set([...post.item ? itemHandles(post.item) : [], ...post.previous ? itemHandles(post.previous) : []])]
       .filter(host => host != own && !replies.has(host))
@@ -391,7 +395,7 @@ export class Mentions {
       const item = items.find((i): i is FeedItem => isObject(i) && i.id == id)
       if (item) {
         const author = accountHost(socialspec(item)) ?? (submissions ? undefined : accountHost(socialspec(owner.doc)))
-        return { ...result, item, ...author ? { author } : {} }
+        return { ...result, item, ...author ? { author } : {}, notifyReplies: notifyReplies(item) }
       }
       const next: unknown = feed.doc.next_url ?? archiveField(feed.doc, 'archive_url')
       if (typeof next != 'string') break

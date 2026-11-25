@@ -257,7 +257,8 @@ export interface FeedOptions {
   maxAttempts?: number
   /**
    * Whether to send RFC-11 mentions after `addPost()`, `editPost()` and `deletePost()`: to the domains a post names
-   * (`@tim.example.com`) and to the author of the item it answers. `true` uses `session.mentions`. Default false.
+   * (`@tim.example.com`) and to the author of the item it answers, unless that item says `notifyReplies: false`.
+   * `true` uses `session.mentions`. Default false.
    * Each write can decide otherwise with its own option `mentions`, e.g. with the accounts the author confirmed.
    */
   mentions?: boolean | Mentions
