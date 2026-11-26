@@ -232,6 +232,7 @@ interface PupsServer {
   postEndpoint?: string
   maxUploadBytes: number
   specVersion: string
+  implementation?: { name: string; version?: string }  // the server software, e.g. pups-php: for working around its known problems
   raw: Record<string, unknown>     // the configuration document as fetched, including unknown fields
 }
 ```

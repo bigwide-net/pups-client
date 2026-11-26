@@ -97,6 +97,14 @@ describe('authorization', () => {
     expect(mock.state.grants[0]!.revoked).toBe(true)
   })
 
+  it('names the server software, if the server says', async () => {
+    const discover = (implementation?: unknown) => newClient(createMockServer({ implementation })).discover('tim.example.com')
+    expect((await discover()).implementation).toEqual({ name: 'mock', version: '1.0' })
+    expect((await discover({ name: 'pups-php' })).implementation).toEqual({ name: 'pups-php' })
+    for (const broken of [null, 'pups-php', { version: '1.0' }, { name: '' }, { name: 3 }])
+      expect((await discover(broken)).implementation).toBeUndefined()
+  })
+
   it('reports a missing PUPS server', async () => {
     const mock = createMockServer()
     expect(await errorCode(newClient(mock).discover('nobody.example'))).toBe('network')

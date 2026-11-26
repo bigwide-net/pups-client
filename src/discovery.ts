@@ -23,6 +23,12 @@ export interface WellKnownPath {
   linkProperties: string[]
 }
 
+/** The server software of a PUPS server (RFC-6 `implementation`). */
+export interface ServerImplementation {
+  name: string
+  version?: string
+}
+
 /** A discovered and validated PUPS server: the configuration document, plus what discovery learned. Plain JSON data. */
 export interface PupsServer {
   /** The normalized domain the user entered, `https://<host>/`. */
@@ -55,6 +61,11 @@ export interface PupsServer {
   keptFeeds: boolean
   maxUploadBytes: number
   specVersion: string
+  /**
+   * The server software (`implementation`), e.g. `{name: 'pups-php', version: '0.1.0'}`, if the server says. For working
+   * around problems of one implementation or the hosting it runs on, not for detecting features: those have fields.
+   */
+  implementation?: ServerImplementation
   /** The configuration document as fetched, including fields this library doesn't know. */
   raw: Record<string, unknown>
 }
@@ -172,6 +183,10 @@ export function parseConfig(json: unknown, domain: string, identityHosts: string
   const hostMetaEndpoint = optionalHttps('host_meta_endpoint')
   const postEndpoint = optionalHttps('post_endpoint')
   const commentEndpoint = optionalHttps('comment_endpoint')
+  // Informational only, so a malformed one is left out rather than failing discovery.
+  const impl = raw.implementation as Record<string, unknown> | undefined
+  const implementation = impl && typeof impl == 'object' && typeof impl.name == 'string' && impl.name
+    ? { name: impl.name, ...typeof impl.version == 'string' && impl.version ? { version: impl.version } : {} } : undefined
   return {
     domain,
     identityHosts,
@@ -189,6 +204,7 @@ export function parseConfig(json: unknown, domain: string, identityHosts: string
     keptFeeds: raw.kept_feeds === true,
     maxUploadBytes: maxUploadBytes as number,
     specVersion,
+    ...implementation ? { implementation } : {},
     raw,
   }
 }

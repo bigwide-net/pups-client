@@ -19,6 +19,8 @@ export interface MockOptions {
   maxUploadBytes?: number
   /** Whether the server keeps feeds with the _pups marker (`kept_feeds`). Default true. */
   keptFeeds?: boolean
+  /** The configuration document's `implementation`, as is. Default {name: 'mock', version: '1.0'}. */
+  implementation?: unknown
 }
 
 interface Pair { refresh: string; access: string; used: boolean }
@@ -60,6 +62,7 @@ export function createMockServer(options: MockOptions = {}) {
     ...options.keptFeeds ?? true ? { kept_feeds: true } : {},
     max_upload_bytes: options.maxUploadBytes ?? 1000,
     spec_version: '0.1',
+    ...options.implementation === null ? {} : { implementation: options.implementation ?? { name: 'mock', version: '1.0' } },
   }
 
   const codes = new Map<string, { clientId: string; redirectUri: string; challenge: string; scopes: string[] }>()
