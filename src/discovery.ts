@@ -1,4 +1,5 @@
 import { PupsError } from './errors.js'
+import { IDENTITY_SCOPE } from './identity.js'
 import { fetchWithTimeout, parseUrl } from './util.js'
 
 /** The link relation in `host-meta.json` that points to the PUPS configuration document. A placeholder in RFC-6 0.1. */
@@ -59,6 +60,16 @@ export interface PupsServer {
    * items by POST. `PupsFeed` needs it to post.
    */
   keptFeeds: boolean
+  /**
+   * Where the server publishes the public keys of its identity tokens (RFC-10 `jwks_uri`); absent if it doesn't
+   * issue any.
+   */
+  jwksUri?: string
+  /**
+   * Whether the server issues identity tokens (RFC-10): it has a `jwks_uri` and lists `identity-tokens` in
+   * `scopes_supported`. Check it before asking for the scope `identity-tokens`.
+   */
+  identityTokens: boolean
   maxUploadBytes: number
   specVersion: string
   /**
@@ -183,6 +194,10 @@ export function parseConfig(json: unknown, domain: string, identityHosts: string
   const hostMetaEndpoint = optionalHttps('host_meta_endpoint')
   const postEndpoint = optionalHttps('post_endpoint')
   const commentEndpoint = optionalHttps('comment_endpoint')
+  const scopesSupported = strings('scopes_supported', raw.scopes_supported)
+  // A malformed jwks_uri only means no identity tokens; everything else still works.
+  const jwks = parseUrl(raw.jwks_uri)
+  const jwksUri = jwks?.protocol == 'https:' && !jwks.hash ? raw.jwks_uri as string : undefined
   // Informational only, so a malformed one is left out rather than failing discovery.
   const impl = raw.implementation as Record<string, unknown> | undefined
   const implementation = impl && typeof impl == 'object' && typeof impl.name == 'string' && impl.name
@@ -196,12 +211,14 @@ export function parseConfig(json: unknown, domain: string, identityHosts: string
     revocationEndpoint: https('revocation_endpoint'),
     storageBase: base('storage_base'),
     publicBase: base('public_base'),
-    scopesSupported: strings('scopes_supported', raw.scopes_supported),
+    scopesSupported,
     wellKnownPaths,
     ...hostMetaEndpoint ? { hostMetaEndpoint } : {},
     ...postEndpoint ? { postEndpoint } : {},
     ...commentEndpoint ? { commentEndpoint } : {},
     keptFeeds: raw.kept_feeds === true,
+    ...jwksUri ? { jwksUri } : {},
+    identityTokens: !!jwksUri && scopesSupported.includes(IDENTITY_SCOPE),
     maxUploadBytes: maxUploadBytes as number,
     specVersion,
     ...implementation ? { implementation } : {},

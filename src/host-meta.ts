@@ -16,6 +16,28 @@ export interface HostMetaLink {
   [field: string]: unknown
 }
 
+/** The link property that announces a feed's access level (RFC-10 "Announcing a feed"). */
+export const ACCESS_PROPERTY = 'https://bigwide.net/ns/access'
+
+/**
+ * Who may read a feed (RFC-10 "Access levels"): `public` (everyone, no token), `restricted` (only domains on the
+ * server's list), `personal` (every domain gets its own version, a token is required), `optional` (public, with a
+ * personal version for subscribers who send a token).
+ */
+export type AccessLevel = 'public' | 'restricted' | 'personal' | 'optional'
+
+/**
+ * The access level a `host-meta.json` link announces in its property `https://bigwide.net/ns/access`: `public` without
+ * it or with `public`, `restricted` for an unknown value. It only informs what a reader offers, e.g. *Subscribe as
+ * @tim.example.com* and a lock for `restricted`; never fetch a feed with a token to find out whether the user has access.
+ * Pages for visitors leave out `restricted` and `personal` feeds.
+ */
+export function accessLevel(link: Pick<HostMetaLink, 'properties'>): AccessLevel {
+  const value = link.properties?.[ACCESS_PROPERTY]
+  if (value == null || value == 'public') return 'public'
+  return value == 'personal' || value == 'optional' ? value : 'restricted'
+}
+
 /** `host-meta.json` (RFC 6415, JSON form). */
 export interface HostMetaDocument {
   subject?: string

@@ -3,7 +3,7 @@ import type { FeedAttachment, FeedAuthor, FeedDocument, FeedItem } from './feed.
 import type { Submission } from './mentions.js'
 import { pathFromPublicUrl } from './paths.js'
 import type { PupsSession } from './session.js'
-import { isObject, randomString } from './util.js'
+import { type InReplyTo, isObject, randomString, replyTarget } from './util.js'
 
 const RFC1_URL = 'https://github.com/bigwide-net/RFCs/blob/main/RFC-1-Source-for-JSON-Feeds.md'
 const JSON_FEED = 'https://jsonfeed.org/version/1.1'
@@ -14,6 +14,12 @@ type Signal = { signal?: AbortSignal }
 export interface CommentInput {
   /** The answered item, as feed URL plus `#<id>`; for a new post in a group, the group feed's URL. */
   target: string
+  /**
+   * The title for `_source.inReplyTo.feedTitle` (RFC-1), which readers show as "In reply to …": for a post, the title of
+   * its feed; for a comment, the comment's title, or `null` if it has none, so that the reader names it. Pass it if the
+   * app has the target; otherwise `post()` reads the target.
+   */
+  inReplyToTitle?: string | null
   title?: string
   content_html?: string
   content_text?: string
@@ -27,7 +33,7 @@ export interface CommentInput {
 }
 
 /** Changes to a comment: a value sets the field, `null` removes it, `undefined` leaves it unchanged. */
-export type CommentChanges = { [K in Exclude<keyof CommentInput, 'target'>]?: CommentInput[K] | null }
+export type CommentChanges = { [K in Exclude<keyof CommentInput, 'target' | 'inReplyToTitle'>]?: CommentInput[K] | null }
 
 export interface CommentResult {
   /** The comment's `source`: the public URL of its comment feed plus `#<id>`. It never changes. */
@@ -77,8 +83,6 @@ export async function commentFeedPath(target: string, date: Date | string): Prom
 const isFeed = (doc: unknown): doc is FeedDocument =>
   isObject(doc) && typeof doc.version == 'string' && doc.version.startsWith('https://jsonfeed.org/version/') && Array.isArray(doc.items)
 
-const inReplyTo = (item: FeedItem) => isObject(item._source) && typeof item._source.inReplyTo == 'string' ? item._source.inReplyTo : undefined
-
 /** Stores Markdown in `_source.markdown` (RFC-1), with `content_text` as the fallback JSON Feed requires. */
 function setMarkdown(item: FeedItem, markdown: string | null) {
   const { markdown: _old, ...source } = isObject(item._source) ? item._source : {}
@@ -115,17 +119,18 @@ export class PupsComments {
 
   /**
    * Publishes a comment: adds it at the top of its comment feed, which is created if needed, and submits it to the
-   * target, once it is visible at its public URL.
+   * target, once it is visible at its public URL. Its `_source.inReplyTo` is RFC-1's object form: the target, its feed,
+   * and a title as `inReplyToTitle` describes, given or read from the target (left out if it can't be read).
    * @throws {PupsError} `invalid_request` for a bad target or missing content; `invalid_feed` if the file holds
    *   something else; the errors of writing.
    */
   async post(input: CommentInput, options: SubmitOption = {}): Promise<CommentResult> {
-    const { target, markdown, ...fields } = input
+    const { target, inReplyToTitle, markdown, ...fields } = input
     const item: FeedItem = { id: randomString(12), ...fields, date_published: now() }
-    item._source = { about: RFC1_URL, ...isObject(item._source) ? item._source : {}, inReplyTo: target }
     if (markdown !== undefined) setMarkdown(item, markdown)
     checkContent(item)
     const path = await this.pathFor(target, item.date_published!)
+    item._source = { about: RFC1_URL, ...isObject(item._source) ? item._source : {}, inReplyTo: await this.#inReplyTo(target, inReplyToTitle, options.signal) }
     const feedUrl = this.#session.publicUrl(path)
     await this.#session.update(path, async file => {
       const doc = file ? await this.#feed(file.json(), path) : this.#newFeed(feedUrl)
@@ -197,11 +202,27 @@ export class PupsComments {
 
   async #result(feedUrl: string, path: string, item: FeedItem, options: SubmitOption, deleted = false): Promise<CommentResult> {
     const source = `${feedUrl}#${encodeURIComponent(item.id)}`
-    const target = inReplyTo(item)
+    const target = replyTarget(item)
     const submission = options.submit ?? true
       ? target && await this.submit(source, target, { signal: options.signal, deleted })
       : undefined
     return { source, path, item, ...submission ? { submission } : {} }
+  }
+
+  /**
+   * RFC-1's `inReplyTo` for a comment on `target`: with the feed of the answered item, and a title. Unless given, the
+   * title is read from the target: a comment's own title, if any (an item that answers something is a comment), else
+   * the feed's.
+   */
+  async #inReplyTo(target: string, title: string | null | undefined, signal?: AbortSignal): Promise<InReplyTo> {
+    if (title === undefined) {
+      const found = await this.#session.mentions.findItem(target, { signal }).catch(e => {
+        if (isPupsError(e, 'aborted')) throw e
+        return undefined
+      })
+      title = found?.item && replyTarget(found.item) ? found.item.title : found?.feedTitle
+    }
+    return { value: target, feedUrl: target.split('#')[0]!, ...typeof title == 'string' && title ? { feedTitle: title } : {} }
   }
 
   #newFeed(feedUrl: string): FeedDocument {
@@ -224,7 +245,7 @@ export class PupsComments {
 
   #change(item: FeedItem, changes: CommentChanges | ((item: FeedItem) => FeedItem)): FeedItem {
     const { id, date_published } = item
-    const target = inReplyTo(item)
+    const target = isObject(item._source) ? item._source.inReplyTo : undefined
     if (typeof changes == 'function') item = changes(item)
     else for (const [key, value] of Object.entries(changes)) {
       if (key == 'markdown') value !== undefined && setMarkdown(item, value as string | null)

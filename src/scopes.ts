@@ -1,5 +1,6 @@
 import { PupsError } from './errors.js'
 import type { PupsServer } from './discovery.js'
+import { IDENTITY_SCOPE } from './identity.js'
 import { isPrivate, scopeCovers } from './paths.js'
 
 /**
@@ -11,8 +12,10 @@ import { isPrivate, scopeCovers } from './paths.js'
  *   In `/pups/private/`, it also allows reading.
  * - `` `read:/${string}` ``: reading a private path in `/pups/private/` that the server declares, without writing it.
  *   Public files need no read scope.
+ * - `'identity-tokens'`: getting identity tokens, which prove to other servers that the owner acts through the app
+ *   (RFC-10). Only if `server.identityTokens`; the owner confirms it separately (step-up).
  */
-export type Scope = 'identify' | 'appdata' | `write:/${string}` | `read:/${string}`
+export type Scope = 'identify' | 'appdata' | 'identity-tokens' | `write:/${string}` | `read:/${string}`
 
 /** The host of the `client_id`, which names the app's own directory. */
 export const clientHostOf = (clientId: string) => new URL(clientId).hostname
@@ -66,12 +69,16 @@ export function validateScopes(scopes: readonly string[], server: PupsServer, cl
   const appDataPath = appDataPathOf(clientId)
   for (const scope of scopes) {
     if (scope == 'identify') continue
+    if (scope == IDENTITY_SCOPE) {
+      if (server.identityTokens) continue
+      throw new PupsError('invalid_scope', `"${scope}": ${new URL(server.domain).host} doesn't issue identity tokens (no jwks_uri, or ${IDENTITY_SCOPE} missing from scopes_supported). Check server.identityTokens before asking (RFC-10).`)
+    }
     const read = readScopePath(scope)
     if (read !== undefined && !read.startsWith('/pups/private/'))
       throw new PupsError('invalid_scope', `"${scope}": read scopes exist only for private paths in /pups/private/. Public files need no read scope, and an app's own private folder is covered by 'appdata' (RFC-6, Scopes).`)
     const path = read ?? writeScopePath(scope)
     if (path === undefined)
-      throw new PupsError('invalid_scope', `"${scope}" is not a PUPS scope. Use 'identify', 'appdata', 'write:/<path>' or 'read:/pups/private/<path>' (RFC-6, Scopes).`)
+      throw new PupsError('invalid_scope', `"${scope}" is not a PUPS scope. Use 'identify', 'appdata', 'identity-tokens', 'write:/<path>' or 'read:/pups/private/<path>' (RFC-6, Scopes).`)
     if (path == appDataPath && read === undefined) continue
     if (path.startsWith('/appdata/'))
       throw new PupsError('invalid_scope', `"${scope}": an app may only ask for its own directory, ${appDataPath}. Use the 'appdata' shorthand (RFC-6, Scopes).`)

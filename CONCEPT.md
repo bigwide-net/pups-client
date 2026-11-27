@@ -230,6 +230,8 @@ interface PupsServer {
   wellKnownPaths: WellKnownPath[]  // { path, url?, rels, properties }
   hostMetaEndpoint?: string
   postEndpoint?: string
+  jwksUri?: string                 // where the server publishes the keys of its identity tokens (RFC-10)
+  identityTokens: boolean          // jwks_uri present and 'identity-tokens' in scopes_supported
   maxUploadBytes: number
   specVersion: string
   implementation?: { name: string; version?: string }  // the server software, e.g. pups-php: for working around its known problems
@@ -240,13 +242,14 @@ interface PupsServer {
 ### Scopes
 
 ```ts
-type Scope = 'identify' | 'appdata' | `write:/${string}` | `read:/${string}`
+type Scope = 'identify' | 'appdata' | 'identity-tokens' | `write:/${string}` | `read:/${string}`
 ```
 
 - `'identify'` is passed through. With it alone, the session can't write, and the server may issue no refresh token.
 - `'appdata'` is a shorthand for `write:/appdata/<client-host>/`, computed from `clientId`. Apps should not spell out their own directory. It includes the app's private folder `private/`.
 - `write:/…` must be a well-known path declared in the server's `wellKnownPaths`, or a directory or file under a declared directory. In `/pups/private/` it allows reading as well.
 - `read:/…` exists only for declared paths in `/pups/private/` (see [Private files](#private-files)). Public files need no read scope.
+- `'identity-tokens'` lets the app get identity tokens (RFC-10, see [Identity tokens](#identity-tokens)), only if `server.identityTokens`. The owner confirms it separately (step-up), and a grant with it always has a refresh token.
 
 `login()` checks every scope against the server before redirecting and throws `invalid_scope` for anything the server would reject. That turns a confusing OAuth error after a round trip into an immediate, explained error. Apps that want to offer a feature only if the server supports it check first:
 
@@ -268,6 +271,7 @@ interface PupsSession {
   readonly appDataPath: string     // '/appdata/app.example/'
   readonly privatePath: string     // '/appdata/app.example/private/'
   readonly persistent: boolean
+  readonly handle: string          // '@tim.example.com', shown wherever something is done as the owner
 
   hasScope(scope: Scope): boolean
   canWrite(path: string): boolean
@@ -286,6 +290,9 @@ interface PupsSession {
   delete(path: string, options?: { ifMatch?: string; signal?: AbortSignal }): Promise<void>
 
   readonly hostMeta: HostMetaEditor
+
+  identityToken(audience: string, options?: { signal?: AbortSignal }): Promise<string>   // RFC-10, a JWT for one origin
+  fetchAsOwner(url: string | URL, init?: RequestInit): Promise<Response>               // one request with a new identity token
 
   logout(options?: { revoke?: boolean }): Promise<{ revoked: boolean }>
 }
@@ -335,6 +342,23 @@ interface StoredFile {
 **Content types.** The extension decides the type, as in the RFC. Without `contentType`, the library sends the served type from the extension table (`.json` → `application/json`). With `contentType`, it must be one of the accepted types for the extension (e.g. `application/feed+json` for `.json`), or the call fails with `unsupported_type` before any request. A blocked extension anywhere in the name (`feed.php.json`) fails the same way.
 
 **Reads.** `get()` reads from `storage_base`, because only ETags from `storage_base` are valid for conditions. By default it is a **fresh read** (RFC-6 "Fresh reads"): it carries the access token, so that no CDN or caching proxy between the app and the server can answer with an old version, and the server returns the latest write with `Cache-Control: private, no-store`. Without it, a cache that kept an old version would make the user miss their own changes, and `update()` would fail with `412` on every attempt, because it would read the same old ETag each time. For public files the token grants nothing else; any valid token works, `identify` included. `get(path, { fresh: false })` sends no token: it may be answered from a cache, but works without a valid session. `get()` returns `undefined` on `404`.
+
+### Identity tokens
+
+RFC-10 lets an app act as the owner's domain on other servers: vote in a poll, moderate a group, read a personal feed. The app exchanges its access token at the PUPS token endpoint for an identity token, a JWT signed by the PUPS server, valid for 60 seconds, for exactly one origin (`aud`), and sends it to that origin. The other server checks it against the keys at `jwks_uri`, found through the domain's `host-meta.json`.
+
+- **`identityToken(audience)`** sends a token exchange (RFC 8693) to `token_endpoint`: `grant_type=urn:ietf:params:oauth:grant-type:token-exchange`, `client_id`, the current access token as `subject_token` (`subject_token_type=urn:ietf:params:oauth:token-type:access_token`) and `audience`. The access token is renewed first if it has expired, and once more if the server answers `invalid_grant`, as for the upload API. It returns `access_token` of the answer, which is the identity token.
+- **`fetchAsOwner(url, init)`** takes the audience from `url` itself, `new URL(url).origin`, never from anything else, gets a new token and sends it once as `Authorization: Bearer` (replacing any `Authorization` in `init`), with `redirect: 'manual'`: no redirect is followed, so that the token reaches no other origin, and a same-origin redirect would need a new token anyway. The PUPS access token is never sent there; `_authorized()` refuses any URL that is not an endpoint of the PUPS server.
+- **Before sending**, the library checks what it can: `server.identityTokens` (`unsupported`), the granted scope (`insufficient_scope`) and that the audience is exactly one `https` origin, without path or `/` (`invalid_target`). The server also refuses IP addresses, `localhost` and `.local` names.
+- **Server errors** map to codes: `invalid_scope` → `insufficient_scope`, `invalid_target` → `invalid_target`, `429` `slow_down` → `rate_limited` with `retryAfter` (60 tokens per grant and minute), `unsupported_grant_type` → `unsupported`, `invalid_grant` twice → `invalid_token`, a failed renewal → `session_expired`.
+- **The rules of RFC-10 for apps** are in the TSDoc: get a token only for an action the user took, presented as done with their identity at that server; show `session.handle` there; one token per request.
+
+```ts
+// A poll in a feed: "Vote as @tim.example.com at polls.example.com"
+const response = await session.fetchAsOwner('https://polls.example.com/polls/42/votes', {
+  method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ choice: 2 }),
+})
+```
 
 ### Private files
 
@@ -493,6 +517,8 @@ type PupsErrorCode =
   // uploads, as in the RFC's error table
   | 'invalid_path' | 'invalid_token' | 'insufficient_scope' | 'not_found' | 'precondition_failed'
   | 'too_large' | 'unsupported_type' | 'insufficient_storage' | 'conflict' | 'rate_limited' | 'invalid_request'
+  // identity tokens (RFC-10)
+  | 'invalid_target'
   // feeds (RFC-7)
   | 'not_pups_controlled' | 'invalid_feed'
   // other
@@ -721,6 +747,18 @@ if (!session.canWrite('/.well-known/about.md')) return showMessage('Profile acce
 await session.update('/.well-known/about.md', () => markdown)
 ```
 
+### A poll vote as the owner (RFC-10)
+
+```ts
+const server = await pups.discover(domain)
+if (!server.identityTokens) return showMessage('Your server does not issue identity tokens.')
+const session = await pups.loginWithPopup(server, { scopes: ['identify', 'identity-tokens'] })
+voteButton.textContent = `Vote as ${session.handle} at polls.example.com`
+voteButton.onclick = () => session.fetchAsOwner('https://polls.example.com/polls/42/votes', {
+  method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ choice: 2 }),
+})
+```
+
 ### A blog feed (RFC-7)
 
 ```ts
@@ -747,7 +785,7 @@ The package also contains `pups`, a command line tool built on the same core. It
 
 - **Client identity.** The user names a client domain they control, e.g. `tim.example.app`. The `client_id` is `https://<client-domain>/pups-cli.json` (or any URL given in full). `pups client-metadata <client-domain>` prints the document to publish there, listing `http://127.0.0.1/callback` and `http://[::1]/callback`; `pups check-client` verifies it, and `pups login` runs the same check first, because otherwise the server would show an error page and the CLI would wait in vain.
 - **Login.** `pups login <domain> -c <client-domain>` listens on a random port of `127.0.0.1`, builds the authorization URL with `createAuthorization()` and redirect URI `http://127.0.0.1:<port>/callback`, opens the system browser (or prints the URL with `--no-browser`), receives the redirect, and finishes with `completeAuthorization()`. RFC-6 ignores the port of loopback redirects, so one entry in the client metadata document covers every port. The callback page has no scripts or external resources and sends `Referrer-Policy: no-referrer`.
-- **Commands.** `whoami`, `put` (several files, `--to` file or directory, `-` for stdin, `--create`, `--if-match`, `--content-type`), `get`, `rm`, `url`, `link add|remove`, `property set`, `logout [--keep-grant]`, `sessions`. `--json` gives machine-readable output. Exit codes: 0 success, 1 error, 2 usage.
+- **Commands.** `whoami`, `put` (several files, `--to` file or directory, `-` for stdin, `--create`, `--if-match`, `--content-type`), `get`, `rm`, `url`, `link add|remove`, `property set`, `identity-token <origin>` (RFC-10), `logout [--keep-grant]`, `sessions`. `--json` gives machine-readable output. Exit codes: 0 success, 1 error, 2 usage.
 - **Credentials** are kept by `FileTokenStore` in `~/.config/pups/sessions.json` (or `$XDG_CONFIG_HOME/pups`, `$PUPS_CONFIG_DIR`), mode 0600 in a 0700 directory, written atomically through a temporary file. That is how tools like `gh` keep credentials; an OS keychain would need native dependencies.
 - **Known limit.** Web Locks only coordinate within one process. Two `pups` processes refreshing the same session at once would make the server revoke the grant, so the documentation says not to run them in parallel, and `put` takes many files at once. A lock file would close this gap later.
 
@@ -762,6 +800,7 @@ pups-client/
     host-meta.ts              HostMetaEditor
     discovery.ts
     oauth.ts
+    identity.ts               RFC-10 token exchange
     scopes.ts
     paths.ts
     file-types.ts             extension table, shared with tests

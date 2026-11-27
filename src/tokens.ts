@@ -1,7 +1,7 @@
 import { normalizeDomain } from './discovery.js'
 import { PupsError } from './errors.js'
 import { tokenRequest } from './oauth.js'
-import type { SessionRecord, TokenStore } from './store/token-store.js'
+import type { ReadTokenRecord, SessionRecord, TokenStore } from './store/token-store.js'
 import { withLock, type TabChannel } from './tabs.js'
 import { sleep } from './util.js'
 
@@ -16,7 +16,13 @@ export const timing = {
   lastRetryStartMs: 45_000,
   /** An access token counts as expired this long before `expires_in` ends, to absorb clock skew. */
   expirySkewMs: 60_000,
+  /** A read token is renewed this long before it expires (at most half its lifetime before). */
+  readTokenMarginMs: 600_000,
 }
+
+/** The stored form of a read token that expires at `expiresAt`. */
+export const readTokenRecord = (token: string, now: number, expiresAt: number): ReadTokenRecord =>
+  ({ token, expiresAt, renewAt: expiresAt - Math.min(timing.readTokenMarginMs, (expiresAt - now) / 2) })
 
 /** When an access token issued now with `expiresIn` seconds should be treated as expired. */
 export const accessTokenExpiry = (now: number, expiresIn: number) =>
@@ -150,6 +156,35 @@ export class TokenManager {
       }
       this.#record = undefined
       return record
+    })
+  }
+
+  /** The read token for `origin`, if there is one that is not due for renewal. */
+  readToken(origin: string): ReadTokenRecord | undefined {
+    const stored = this.#record?.readTokens?.[origin]
+    return stored && stored.renewAt > Date.now() ? stored : undefined
+  }
+
+  /**
+   * Stores (or with undefined, forgets) the read token for `origin` under the refresh lock, as safely as the access
+   * token, and drops expired ones. A store that fails keeps it in this tab's memory only.
+   */
+  setReadToken(origin: string, token: ReadTokenRecord | undefined): Promise<void> {
+    return withLock(this.#lockName, async () => {
+      let record = this.#record
+      if (!record) return
+      if (this.#persistent) record = await this.#ctx.store.get(record.clientId, record.me).catch(() => undefined) ?? record
+      const now = Date.now()
+      const readTokens = Object.fromEntries(Object.entries({ ...record.readTokens, [origin]: token })
+        .filter((e): e is [string, ReadTokenRecord] => !!e[1] && e[1].expiresAt > now))
+      const next = this.#setRecord({ ...record, readTokens })
+      if (!this.#persistent) return
+      try {
+        await this.#ctx.store.put(next)
+        this.#ctx.channel.post({ type: 'tokens', me: next.me })
+      } catch {
+        // Kept in memory.
+      }
     })
   }
 

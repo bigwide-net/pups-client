@@ -2,10 +2,11 @@ import { isPupsError, PupsError } from './errors.js'
 import { fileTypes } from './file-types.js'
 import { pathFromPublicUrl } from './paths.js'
 import { itemHandles } from './handles.js'
+import { accessLevel, type AccessLevel } from './host-meta.js'
 import type { Mentions, MentionReport, MentionSource, PlannedMention, Submission } from './mentions.js'
 import type { Scope } from './scopes.js'
 import type { Body, PupsSession } from './session.js'
-import { isObject, randomString } from './util.js'
+import { isObject, randomString, replyTarget } from './util.js'
 
 /** The link relation that registers a feed in `host-meta.json` (RFC-7). A placeholder in RFC-7. */
 export const FEED_REL = 'https://bigwide.net/ns/feed'
@@ -269,6 +270,8 @@ export interface FeedLink {
   /** The public URL of the feed file. */
   url: string
   type?: string
+  /** The access level the link announces (RFC-10), `public` unless it says otherwise. */
+  access: AccessLevel
   /** Set if the feed is a main or named feed on this PUPS server, in the layout of RFC-7. */
   feed?: PupsFeed
 }
@@ -691,9 +694,9 @@ export class PupsFeed {
   async submit(id: string, options: Signal = {}): Promise<Submission> {
     const post = await this.getPost(id, options)
     if (!post) throw new PupsError('not_found', `The feed has no post with the id "${id}".`)
-    const source = isObject(post.item._source) ? post.item._source : {}
-    if (typeof source.inReplyTo != 'string') throw new PupsError('invalid_request', `The post "${id}" has no _source.inReplyTo, so it answers nothing (RFC-4).`)
-    return this.#session.mentions.submit(post.url, source.inReplyTo, options)
+    const target = replyTarget(post.item)
+    if (!target) throw new PupsError('invalid_request', `The post "${id}" has no _source.inReplyTo, so it answers nothing (RFC-4).`)
+    return this.#session.mentions.submit(post.url, target, options)
   }
 
   /**
@@ -727,7 +730,7 @@ export class PupsFeed {
    */
   #sendMentions(choice: MentionChoice | undefined, fileUrl: string, item: FeedItem | undefined, previous: FeedItem | undefined, ready: (item?: FeedItem) => boolean): Promise<MentionReport[]> | undefined {
     choice ??= !!this.#mentions
-    const relevant = (i?: FeedItem) => !!i && (itemHandles(i).length > 0 || (isObject(i._source) && typeof i._source.inReplyTo == 'string'))
+    const relevant = (i?: FeedItem) => !!i && (itemHandles(i).length > 0 || !!replyTarget(i))
     if (Array.isArray(choice) ? !choice.length : !choice || !(relevant(item) || relevant(previous))) return
     const mentions = this.#mentionSender
     const id = (item ?? previous)!.id
@@ -990,6 +993,6 @@ export async function listFeeds(session: PupsSession, options: Signal & FeedOpti
       } catch {
         // Not a valid feed name, e.g. an archive or a link the owner added.
       }
-    return { url, ...typeof link.type == 'string' ? { type: link.type } : {}, ...feed ? { feed } : {} }
+    return { url, ...typeof link.type == 'string' ? { type: link.type } : {}, access: accessLevel(link), ...feed ? { feed } : {} }
   })
 }

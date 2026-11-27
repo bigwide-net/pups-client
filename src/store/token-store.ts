@@ -19,6 +19,17 @@ export interface SessionRecord {
   createdAt: number
   /** Updated at login and at every refresh. */
   lastUsedAt: number
+  /** Read tokens (RFC-10) by origin, reused for the fetches of personal feeds there. */
+  readTokens?: Record<string, ReadTokenRecord>
+}
+
+/** A stored read token (RFC-10 "Read tokens"). Times in milliseconds since the epoch. */
+export interface ReadTokenRecord {
+  token: string
+  /** When the token expires, from `expires_in`. */
+  expiresAt: number
+  /** When to get a new one instead: shortly before `expiresAt`. */
+  renewAt: number
 }
 
 /**

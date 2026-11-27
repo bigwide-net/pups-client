@@ -168,13 +168,14 @@ const feed = session.feed(undefined, { mentions: true })
 const post = await feed.addPost({ content_html: '<p>Great talk by <a href="https://alice.example/">@alice.example</a></p>' })
 for (const r of await post.mentions ?? []) console.log(r.account, r.status)   // @alice.example accepted
 
-const comment = await session.comments.post({ target: 'https://rm.example/groups/g/posts.json#a8Kd03', markdown: 'Agreed!' })
+const comment = await session.comments.post({ target: 'https://rm.example/groups/g/posts.json#a8Kd03', inReplyToTitle: 'Two Waves', markdown: 'Agreed!' })
 await session.mentions.submissionStatus(comment.submission!.statusUrl!)   // { status: 'success', pubUrl: … }
 
 await session.mentions.notify(source, '@alice.example')           // the generic interface: any source, any account
 await session.mentions.reply(source, 'https://bob.example/feed.json#p-12')
 ```
 
+- **What a comment answers.** `comments.post()` writes `_source.inReplyTo` in RFC-1's object form, `{ value: target, feedUrl, feedTitle }`, so that readers can show "In reply to Two Waves". `feedUrl` is the target without its `#id`. The title is the feed's for a comment on a post, and the comment's own for a reply to a comment; a comment without a title gets none, so that the reader names it. Pass it as `inReplyToTitle` (`null` for none) if the app has the target; otherwise `post()` reads the target, and leaves the title out if it can't be read. To read what any item answers, in either form, use `replyTarget(item)`.
 - **Asking first.** `feed.planMentions(input)` lists the accounts a post would notify, without sending anything, so the app can ask before posting. Each write takes `{ mentions }`: `true`, `false` (post without mentions), or the confirmed list:
 
   ```ts
@@ -189,6 +190,33 @@ await session.mentions.reply(source, 'https://bob.example/feed.json#p-12')
 - **Discovery.** The endpoint is the link `https://bigwide.net/ns/mention` in the domain's `host-meta.json`, cached for a day, failures for an hour. A domain without one, or whose `host-meta.json` doesn't allow CORS, gets nothing. An endpoint without CORS headers still receives the mention; its report says `unknown`.
 - **Comments** on other feeds, and posts to discussion groups, are RFC-4 submissions. They never go into the owner's main feed: `session.comments` keeps them in comment feeds in the app's own directory, one file per target site and hour, `/appdata/<client-host>/comments/<hash3>/<hash>.json`, as RFC-7 "Comment feeds" recommends, which needs the `appdata` scope. `post()` adds the comment to its file (creating it if needed) and submits it to the target once it is visible; `edit(source, changes)` and `delete(source)` change the file and submit again with the same `source`; `{ submit: false }` writes without submitting. Show the target's terms of service and what `republish` means before the first submission. No mentions are sent for comments: the RFC-4 server sends them once it republishes the comment. A comment with `_commenting: { notifyReplies: false }` tells it that its author doesn't want reply mentions for it. `feed.submit()` is deprecated.
 - `new Mentions({ fetch })` works without a session. `findHandles()`, `itemHandles()` and `visibleText()` are exported too.
+
+### Identity tokens
+
+An app can act as the owner's domain on other servers, e.g. vote in a poll or moderate a group there, with [RFC-10](https://github.com/bigwide-net/RFCs/blob/main/RFC-10-Identity-Tokens.md) identity tokens: short-lived tokens, signed by the PUPS server, that prove to one other server that `@tim.example.com` acts through this app. The PUPS access token never leaves the PUPS server.
+
+```ts
+const server = await pups.discover(domain)
+if (!server.identityTokens) return showMessage("Your server can't vote for you elsewhere.")
+const session = await pups.loginWithPopup(server, { scopes: ['identify', 'identity-tokens'] })   // the owner confirms it separately
+
+// Next to the poll: "Vote as @tim.example.com at polls.example.com"
+label.textContent = `Vote as ${session.handle} at ${new URL(poll.voteUrl).host}`
+voteButton.onclick = async () => {
+  const response = await session.fetchAsOwner(poll.voteUrl, {      // e.g. https://polls.example.com/polls/42/votes
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ choice: 2 }),
+  })
+  if (!response.ok) showMessage(`The vote failed (${response.status}).`)
+}
+```
+
+- `session.fetchAsOwner(url, init)` gets a new token for the origin of `url` (`https://polls.example.com`) and sends it once, as `Authorization: Bearer <token>`. It doesn't follow redirects, so the token can't end up elsewhere; the response is returned as it is (in browsers a redirect is an opaque response with status 0).
+- `session.identityToken(audience)` returns the token itself, a JWT valid for about a minute, for an origin, e.g. for a `WebSocket` or a request you send yourself. Get a new one for every request; the server may reject one it has seen.
+- **Only when the user acts.** Get a token only when the user does something the app presented as done with their identity at that server, and show `session.handle` and the server there. Never in the background, when fetching or previewing, or because content asked for it. Take the audience from the URL you send to, never from a feed or a response.
+- **Errors**: `unsupported` (the server issues no identity tokens: check `server.identityTokens`), `insufficient_scope` (the grant lacks `identity-tokens`: log in again), `invalid_target` (not one `https` origin, or one the server refuses, e.g. an IP address), `rate_limited` (60 tokens per grant and minute; see `retryAfter`), `session_expired`. The access token is renewed first if needed.
+- On the command line: `pups login <domain> -c <client> -s identity-tokens`, then `pups identity-token https://polls.example.com` prints a token, e.g. to test a server with `curl -H "Authorization: Bearer $(pups identity-token …)"`.
 
 ### What the library does for you
 

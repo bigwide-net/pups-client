@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it } from 'vitest'
 import { PupsClient } from '../src/client.js'
 import { commentFeedPath } from '../src/comments.js'
 import { isPupsError } from '../src/errors.js'
+import type { FeedItem } from '../src/feed.js'
 import { MemoryTokenStore } from '../src/store/memory-store.js'
 import { createMockServer } from './mock-server.js'
 
@@ -12,11 +13,13 @@ afterEach(() => {
 })
 
 const group = 'https://rm.example.org/groups/twowaves/posts.json'
+const inReplyTo = (item: FeedItem) => (item._source as { inReplyTo?: unknown }).inReplyTo
 const endpoint = 'https://rm.example.org/groups/twowaves/mention'
+const comments = 'https://rm.example.org/groups/twowaves/comments/a8Kd03XpQz.json'
 
 /** A session with the `appdata` scope, and a discussion group on rm.example.org that records the webmentions it gets. */
 async function connect() {
-  const mock = createMockServer()
+  const mock = createMockServer({ maxUploadBytes: 10_000 })
   const received: [string | null, string | null][] = []
   const json = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json' } })
   const fetchFn: typeof fetch = async (input, init) => {
@@ -24,6 +27,10 @@ async function connect() {
     const url = request.url.replace(/#.*/, '')
     if (url.startsWith(origin)) return mock.fetch(input, init)
     if (url == group) return json({ version: 'https://jsonfeed.org/version/1.1', title: 'Group', items: [{ id: 'a8Kd03XpQz', content_text: 'Hi' }], _submissions: { url: endpoint, republish: 'full' } })
+    if (url == comments) return json({ version: 'https://jsonfeed.org/version/1.1', title: 'Comments on “Hi”', items: [
+      { id: 'c1', title: 'Agreed', content_text: 'Yes', _source: { inReplyTo: `${group}#a8Kd03XpQz` } },
+      { id: 'c2', content_text: 'No', _source: { inReplyTo: { value: `${group}#a8Kd03XpQz` } } },
+    ] })
     if (url == 'https://alice.example.com/feed.json') return json({ version: 'https://jsonfeed.org/version/1.1', title: 'Blog', items: [{ id: 'post-42', content_text: 'Hi' }], _submissions: { url: endpoint, republish: 'full' } })
     if (url == endpoint) {
       const params = new URLSearchParams(await request.text())
@@ -72,7 +79,9 @@ describe('comments', () => {
       _source: { about: expect.any(String), accounts: { socialspec: '@tim.example.com' } },
       items: [result.item],
     })
-    expect(result.item).toMatchObject({ content_text: 'Agreed, but discovery is hard.', _source: { inReplyTo: `${group}#a8Kd03XpQz`, markdown: 'Agreed, but discovery is hard.' } })
+    // inReplyTo names the target's feed, with the title read from it (RFC-1).
+    expect(result.item).toMatchObject({ content_text: 'Agreed, but discovery is hard.', _source: {
+      inReplyTo: { value: `${group}#a8Kd03XpQz`, feedUrl: group, feedTitle: 'Group' }, markdown: 'Agreed, but discovery is hard.' } })
     expect(result.item.id).toMatch(/^[A-Za-z0-9_-]{16}$/)
     expect(mock.state.files.has('/feed.json')).toBe(false)
     expect(received).toEqual([[result.source, `${group}#a8Kd03XpQz`]])
@@ -96,7 +105,7 @@ describe('comments', () => {
     expect((await session.comments.get(posted.source))!.item).toEqual(posted.item)
     const edited = await session.comments.edit(posted.source, { content_text: 'First', _source: { about: 'x', inReplyTo: 'https://evil.example/feed.json#1' } })
     expect(edited.source).toBe(posted.source)
-    expect(edited.item).toMatchObject({ id: posted.item.id, date_published: posted.item.date_published, content_text: 'First', _source: { inReplyTo: `${group}#a8Kd03XpQz` } })
+    expect(edited.item).toMatchObject({ id: posted.item.id, date_published: posted.item.date_published, content_text: 'First', _source: { inReplyTo: inReplyTo(posted.item) } })
     expect(edited.item.date_modified).toBeDefined()
     expect(read(posted.path).items).toEqual([edited.item])
     expect(received.map(([source, target]) => [source, target])).toEqual([[posted.source, `${group}#a8Kd03XpQz`], [posted.source, `${group}#a8Kd03XpQz`]])
@@ -115,6 +124,21 @@ describe('comments', () => {
     expect(received.at(-1)).toEqual([a.source, `${group}#a8Kd03XpQz`])
     expect(await session.comments.get(a.source)).toBeUndefined()
     expect(isPupsError(await session.comments.delete(a.source).catch(e => e), 'not_found')).toBe(true)
+  })
+
+  it('name the answered comment by its title, or not at all, and take the title from the app', async () => {
+    const { session, received } = await connect()
+    const titled = await session.comments.post({ target: `${comments}#c1`, content_text: 'A' }, { submit: false })
+    expect(inReplyTo(titled.item)).toEqual({ value: `${comments}#c1`, feedUrl: comments, feedTitle: 'Agreed' })
+    const untitled = await session.comments.post({ target: `${comments}#c2`, content_text: 'B' }, { submit: false })
+    expect(inReplyTo(untitled.item)).toEqual({ value: `${comments}#c2`, feedUrl: comments })
+    const given = await session.comments.post({ target: `${group}#a8Kd03XpQz`, inReplyToTitle: 'Two Waves', content_text: 'C' })
+    expect(inReplyTo(given.item)).toEqual({ value: `${group}#a8Kd03XpQz`, feedUrl: group, feedTitle: 'Two Waves' })
+    const none = await session.comments.post({ target: `${group}#a8Kd03XpQz`, inReplyToTitle: null, content_text: 'D' }, { submit: false })
+    expect(inReplyTo(none.item)).toEqual({ value: `${group}#a8Kd03XpQz`, feedUrl: group })
+    const unknown = await session.comments.post({ target: 'https://gone.example/feed.json#1', content_text: 'E' }, { submit: false })
+    expect(inReplyTo(unknown.item)).toEqual({ value: 'https://gone.example/feed.json#1', feedUrl: 'https://gone.example/feed.json' })
+    expect(received).toEqual([[given.source, `${group}#a8Kd03XpQz`]])
   })
 
   it('refuse sources outside the app\'s comment feeds', async () => {

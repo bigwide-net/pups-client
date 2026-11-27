@@ -54,8 +54,11 @@ export type PupsErrorCode =
   | 'rate_limited'
   /** `400` for a reason other than the path, or an argument the library can't send. */
   | 'invalid_request'
+  // Identity tokens (RFC-10)
+  /** The audience of an identity token is not one `https` origin that the PUPS server issues tokens for. */
+  | 'invalid_target'
   // Other
-  /** The server doesn't offer the feature, e.g. no `host_meta_endpoint`. */
+  /** The server doesn't offer the feature, e.g. no `host_meta_endpoint`, or no identity tokens. */
   | 'unsupported'
   /** The request couldn't be sent, or timed out. */
   | 'network'

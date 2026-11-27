@@ -117,6 +117,15 @@ describe('notifyAll', () => {
     expect([web.received(alice), web.received(bob), web.received(carol)]).toEqual([[[source, 'https://alice.example/']], [[source, 'https://bob.example/feed.json#b1']], []])
   })
 
+  it('takes inReplyTo in the object form, with feedUrl and feedTitle (RFC-1)', async () => {
+    const web = createWeb()
+    const bob = web.receiver('bob.example')
+    web.feed('https://bob.example/feed.json', [{ id: 'b1', content_text: 'Hi', ...by('@bob.example') }])
+    const inReplyTo = { value: 'https://bob.example/feed.json#b1', feedUrl: 'https://bob.example/feed.json', feedTitle: 'Bob' }
+    await quick(web).notifyAll({ source, item: { id: 'p1', content_text: 'Re', ...by('@tim.example.com', { inReplyTo }) } as FeedItem, me: `${origin}/` })
+    expect(web.received(bob)).toEqual([[source, 'https://bob.example/feed.json#b1']])
+  })
+
   it('after an edit or delete, notifies everyone the old or the new version mentions', async () => {
     const web = createWeb()
     const [a, b] = ['a.example', 'b.example'].map(h => web.receiver(h))

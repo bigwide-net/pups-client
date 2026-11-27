@@ -1,7 +1,7 @@
 import type { FeedItem } from './feed.js'
 import { accountHost, asciiHost, itemHandles, type HandleSource } from './handles.js'
 import { isPupsError, PupsError } from './errors.js'
-import { fetchWithTimeout, isObject, sleep } from './util.js'
+import { fetchWithTimeout, isObject, replyTarget, sleep } from './util.js'
 
 /** The link relation of the mention endpoint in `host-meta.json` (RFC-11 "Discovery"). A placeholder in RFC-11. */
 export const MENTION_REL = 'https://bigwide.net/ns/mention'
@@ -94,6 +94,8 @@ export type SubmissionStatus =
 export interface FoundItem {
   /** The URL of the feed or archive that was fetched first. */
   feedUrl: string
+  /** Its title. */
+  feedTitle?: string
   /** The RFC-4 `_submissions` that apply: the feed's, or for an RFC-7 archive, those of its feed file. */
   submissions?: Record<string, unknown>
   /** The item, if it was found. */
@@ -138,7 +140,6 @@ const protocolOf = (url: unknown) => {
 const isHttps = (url: unknown): url is string => protocolOf(url) == 'https:'
 const isHttpUrl = (url: unknown): url is string => isHttps(url) || protocolOf(url) == 'http:'
 
-const inReplyTo = (item?: MentionSource) => isObject(item?._source) && typeof item._source.inReplyTo == 'string' ? item._source.inReplyTo : undefined
 const notifyReplies = (item: FeedItem) => !(isObject(item._commenting) && item._commenting.notifyReplies === false)
 const socialspec = (o: unknown) => isObject(o) && isObject(o._source) && isObject(o._source.accounts) ? o._source.accounts.socialspec : undefined
 const retryable = (status: number) => status == 429 || status >= 500
@@ -332,7 +333,7 @@ export class Mentions {
     const me = post.me ?? this.#me
     const own = me ? asciiHost(new URL(me).hostname) : undefined
     const replies = new Map<string, string>()
-    for (const target of new Set([inReplyTo(post.item), inReplyTo(post.previous)].filter((t): t is string => !!t?.includes('#')))) {
+    for (const target of new Set([replyTarget(post.item), replyTarget(post.previous)].filter((t): t is string => !!t?.includes('#')))) {
       const found = await this.findItem(target, options).catch(e => {
         if (isPupsError(e, 'aborted')) throw e
         return undefined
@@ -385,7 +386,8 @@ export class Mentions {
       owner = feedUrl.host == new URL(first.url).host ? await this.#readFeed(feedUrl.href, options.signal).catch(() => ({ url: feedUrl.href, doc: {} })) : { url: feedUrl.href, doc: {} }
     }
     const submissions = isObject(owner.doc._submissions) ? owner.doc._submissions : undefined
-    const result: FoundItem = { feedUrl: first.url, ...submissions ? { submissions } : {} }
+    const title = typeof first.doc.title == 'string' && first.doc.title ? first.doc.title : undefined
+    const result: FoundItem = { feedUrl: first.url, ...title ? { feedTitle: title } : {}, ...submissions ? { submissions } : {} }
     if (options.item === false || id === undefined) return result
     const seen = new Set<string>()
     let feed: Feed | undefined = first

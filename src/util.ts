@@ -120,3 +120,21 @@ export const isLoopbackHost = (hostname: string) => hostname == '127.0.0.1' || h
 
 /** Control characters: C0, DEL and C1. */
 export const controlChars = /[\u0000-\u001f\u007f-\u009f]/
+
+/** RFC-1's `_source.inReplyTo` in the object form, as the source namespace's `<source:inReplyTo feedUrl feedTitle>`. */
+export interface InReplyTo {
+  /** What the item answers: a permalink, or a feed URL plus `#<id>`. */
+  value: string
+  isPermaLink?: boolean
+  /** The feed that contains the answered item. */
+  feedUrl?: string
+  /** That feed's title, which readers show as "In reply to …". */
+  feedTitle?: string
+}
+
+/** What an item answers: its `_source.inReplyTo` (RFC-1), the string or the `value` of the object form. */
+export function replyTarget(item: unknown): string | undefined {
+  const v = isObject(item) && isObject(item._source) ? item._source.inReplyTo : undefined
+  const value = isObject(v) ? v.value : v
+  return typeof value == 'string' ? value : undefined
+}

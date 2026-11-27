@@ -4,6 +4,7 @@ import { errorFromResponse, isPupsError, PupsError } from './errors.js'
 import { listFeeds, PupsFeed, type FeedLink, type FeedOptions } from './feed.js'
 import { fileTypeOf, uploadContentType } from './file-types.js'
 import { HostMetaEditor } from './host-meta.js'
+import { bearerChallenge, checkAudience, exchangeToken, IDENTITY_SCOPE } from './identity.js'
 import { Mentions } from './mentions.js'
 import { revokeToken } from './oauth.js'
 import { isPrivate, publicUrl, resolvePath, scopeCovers, storageUrl, validatePath } from './paths.js'
@@ -13,7 +14,7 @@ import {
 } from './scopes.js'
 import type { SessionRecord, TokenStore } from './store/token-store.js'
 import type { TabChannel } from './tabs.js'
-import { TokenManager } from './tokens.js'
+import { readTokenRecord, TokenManager } from './tokens.js'
 import { fetchWithTimeout } from './util.js'
 
 const readTimeoutMs = 30_000
@@ -61,6 +62,16 @@ export interface StoredFile {
   /** The content decoded as UTF-8. */
   text(): Promise<string>
   json<T = unknown>(): Promise<T>
+}
+
+/** An identity token (RFC-10), as `identityToken()` returns it. */
+export interface IdentityToken {
+  /** The token, a JWT, to send as `Authorization: Bearer <token>`. */
+  token: string
+  /** When it expires, from the server's `expires_in`. */
+  expiresAt: Date
+  /** Whether it is a read token, good only for fetching feeds. */
+  read: boolean
 }
 
 export type SessionChangeEvent =
@@ -149,6 +160,14 @@ export class PupsSession {
     return this.server.issuer
   }
 
+  /**
+   * The owner's handle, `@<host>`, e.g. `@tim.example.com`. Show it wherever the app says that something is done as
+   * the owner, e.g. next to an action that uses an identity token (RFC-10 "Using identity tokens in an app").
+   */
+  get handle(): string {
+    return `@${new URL(this.me).hostname}`
+  }
+
   /** The granted scopes. The owner may have granted fewer than requested. */
   get scopes(): readonly string[] {
     return this._tokens.record.scopes
@@ -170,7 +189,7 @@ export class PupsSession {
    */
   hasScope(scope: Scope): boolean {
     const [expanded] = expandScopes([scope], this.clientId)
-    if (expanded == 'identify') return this.scopes.includes('identify')
+    if (expanded == 'identify' || expanded == IDENTITY_SCOPE) return this.scopes.includes(expanded)
     const read = readScopePath(expanded!)
     const path = read ?? writeScopePath(expanded!)
     return path !== undefined && (read === undefined ? writeScopePaths : readScopePaths)(this.scopes).some(granted => scopeCovers(granted, path))
@@ -362,6 +381,112 @@ export class PupsSession {
   /** The feeds registered in the owner's `host-meta.json`, e.g. to let the owner choose one to post to. */
   listFeeds(options: { signal?: AbortSignal } & FeedOptions = {}): Promise<FeedLink[]> {
     return listFeeds(this, options)
+  }
+
+  /**
+   * Gets an identity token (RFC-10): a signed token that proves to `audience` that the owner acts through this app.
+   * Needs the scope `identity-tokens`. Renews the access token first if needed.
+   *
+   * A token for an action (the default) lives about a minute: get a new one for every request and send it only in
+   * that request, as `Authorization: Bearer <token>`. Get one only when the user does something that the app presented
+   * as done with their identity at that server, showing {@link handle} and the server, never in the background.
+   * `fetchAsOwner()` does all of this for one request.
+   *
+   * With `read: true`, a read token (RFC-10 "Read tokens"): good only for fetching feeds, for up to 24 hours. It is
+   * kept for its origin as safely as the access token and handed out again until shortly before it expires. Ask for
+   * one only for a feed the user subscribed to as themselves; `fetchFeedAsOwner()` uses it. Never send it with an
+   * action.
+   * @param audience the origin of the URL the request goes to, e.g. `https://polls.example.com`, taken from that URL.
+   * @throws {PupsError} `unsupported` if the server doesn't issue identity tokens (or read tokens); `insufficient_scope`
+   *   if the grant lacks `identity-tokens`; `invalid_target` for an audience that is not one `https` origin, or one the
+   *   server refuses; `rate_limited` if the app asked for too many (see `retryAfter`); `session_expired`.
+   */
+  async identityToken(audience: string, options: { signal?: AbortSignal; read?: boolean } = {}): Promise<IdentityToken> {
+    if (!options.read) return this.#exchange(audience, false, options.signal)
+    checkAudience(audience)
+    return this.#readToken(audience, options.signal)
+  }
+
+  /**
+   * Forgets the read token for the origin of `url` (an origin or any URL there), e.g. when the user unsubscribes from
+   * the last feed they read as themselves there, or makes the subscription anonymous.
+   */
+  forgetReadToken(url: string | URL): Promise<void> {
+    return this._tokens.setReadToken(new URL(url).origin, undefined)
+  }
+
+  /**
+   * Sends one request as the owner (RFC-10): gets a new identity token for the origin of `url` and sends it as
+   * `Authorization: Bearer <token>`. The PUPS access token is never sent, and neither is a read token. Redirects are
+   * not followed (`redirect: 'manual'`), so that the token goes nowhere else; the response is returned as it is, in
+   * browsers an opaque redirect with status 0. Use it only for an action the user took, see `identityToken()`.
+   * @returns the response, whatever its status.
+   * @throws {PupsError} those of `identityToken()`; `network`, `aborted`.
+   */
+  async fetchAsOwner(url: string | URL, init: RequestInit = {}): Promise<Response> {
+    const target = new URL(url)
+    const signal = init.signal ?? undefined
+    const { token } = await this.identityToken(target.origin, { signal })
+    return this.#sendWithToken(target, init, token, writeTimeoutMs, signal)
+  }
+
+  /**
+   * Fetches a feed as the owner (RFC-10 "Personal feeds"), with `GET` or `HEAD` and the read token for the origin of
+   * `url`, which it gets or renews as needed. After a `401` with `error="invalid_token"` it tries once more with a new
+   * read token. Redirects are not followed, so that the token reaches no other URL; the response is returned as it is.
+   *
+   * Only for a feed the user subscribed to as themselves: never because a feed, a link or a challenge asked for it.
+   * Pass `If-None-Match` in `headers` for conditional polling.
+   * @returns the response, whatever its status: `200` (subscribed, with the handle shown), `403` (the domain has no
+   *   access; see `identityChallenge()` for the server's explanation), `304`, or another.
+   * @throws {PupsError} those of `identityToken()`; `invalid_request` for a method other than `GET` or `HEAD`;
+   *   `network`, `aborted`.
+   */
+  async fetchFeedAsOwner(url: string | URL, init: { method?: 'GET' | 'HEAD'; headers?: HeadersInit; signal?: AbortSignal } = {}): Promise<Response> {
+    const method = (init.method ?? 'GET').toUpperCase()
+    if (method != 'GET' && method != 'HEAD')
+      throw new PupsError('invalid_request', `Read tokens are only for GET and HEAD of feeds, not ${method}; use fetchAsOwner() for actions (RFC-10, Read tokens).`)
+    const target = new URL(url)
+    let token = await this.identityToken(target.origin, { read: true, signal: init.signal })
+    for (let attempt = 0; ; attempt++) {
+      const response = await this.#sendWithToken(target, { method, headers: init.headers ?? {} }, token.token, readTimeoutMs, init.signal)
+      if (attempt || response.status != 401 || bearerChallenge(response.headers.get('WWW-Authenticate'))?.error != 'invalid_token') return response
+      token = await this.#readToken(target.origin, init.signal, token.token)
+    }
+  }
+
+  /** Gets or renews a token exchange's result, renewing the access token once if the server rejects it. */
+  async #exchange(audience: string, read: boolean, signal?: AbortSignal): Promise<IdentityToken> {
+    if (!this.server.identityTokens)
+      throw new PupsError('unsupported', `${this.server.issuer} doesn't issue identity tokens (no jwks_uri, or ${IDENTITY_SCOPE} missing from scopes_supported).`)
+    if (!this.scopes.includes(IDENTITY_SCOPE))
+      throw new PupsError('insufficient_scope', `The session has no ${IDENTITY_SCOPE} scope. Log in again and ask for it.`)
+    checkAudience(audience)
+    let accessToken = await this._tokens.accessToken()
+    for (let attempt = 0; ; attempt++) {
+      const result = await exchangeToken(this.#ctx.fetch, this.server, this.clientId, accessToken, audience, read, signal)
+      if ('token' in result) return { token: result.token, expiresAt: new Date(Date.now() + result.expiresIn * 1000), read }
+      // The server rejected the access token: renew it once, as for the upload API.
+      if (attempt)
+        throw new PupsError('invalid_token', `${this.server.issuer} doesn't accept the access token for a token exchange, even after renewing it.`)
+      accessToken = await this._tokens.accessToken(accessToken)
+    }
+  }
+
+  /** The stored read token for `origin`, or a new one if there is none, it is due for renewal, or it is `stale`. */
+  async #readToken(origin: string, signal?: AbortSignal, stale?: string): Promise<IdentityToken> {
+    const stored = this._tokens.readToken(origin)
+    if (stored && stored.token != stale) return { token: stored.token, expiresAt: new Date(stored.expiresAt), read: true }
+    const issued = await this.#exchange(origin, true, signal)
+    await this._tokens.setReadToken(origin, readTokenRecord(issued.token, Date.now(), issued.expiresAt.getTime()))
+    return issued
+  }
+
+  /** Sends `init` to `target` with `Authorization: Bearer <token>`, without following redirects. */
+  #sendWithToken(target: URL, init: RequestInit, token: string, timeoutMs: number, signal?: AbortSignal): Promise<Response> {
+    const headers = new Headers(init.headers)
+    headers.set('Authorization', `Bearer ${token}`)
+    return fetchWithTimeout(this.#ctx.fetch, target.href, { ...init, headers, redirect: 'manual' }, timeoutMs, signal)
   }
 
   /**

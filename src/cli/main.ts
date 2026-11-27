@@ -31,6 +31,7 @@ Working with files (paths without leading "/" are in the app's own directory):
   pups url <path>                      Print the public URL of a path
   pups link add|remove <rel> <path>    Add or remove a host-meta.json link to one of your files
   pups property set <uri> <value>      Set a host-meta.json property
+  pups identity-token <origin>         Print an identity token for <origin> (RFC-10, scope identity-tokens)
   pups logout [--keep-grant]           Forget the credentials and revoke the grant
   pups sessions                        List stored sessions
 
@@ -39,7 +40,7 @@ Options:
                              or the URL of its client metadata document. Env: PUPS_CLIENT
   -d, --domain <domain>      Which signed-in domain to use. Default: the most recent. Env: PUPS_DOMAIN
   -s, --scope <scope>        login: scope to request, repeatable: appdata (default), identify,
-                             write:/<well-known path>, read:/pups/private/<private path>
+                             identity-tokens, write:/<well-known path>, read:/pups/private/<private path>
       --no-browser           login: print the URL instead of opening the browser
       --skip-check           login: don't check the client metadata document first
       --to <path>            put: target path, or directory ending in "/". Default: the file name
@@ -49,6 +50,7 @@ Options:
   -o, --output <file>        get: write to a file
       --type <media type>    link add: the link's type
       --keep-grant           logout: only forget the credentials on this computer
+      --read                 identity-token: a read token for feeds, valid up to 24 hours and kept for reuse
       --json                 Machine-readable output (whoami, put, sessions)
   -h, --help                 Show this help
       --version              Show the version
@@ -81,8 +83,8 @@ export function cliClientMetadata(clientId: string) {
 }
 
 const parseScope = (scope: string): Scope => {
-  if (scope == 'identify' || scope == 'appdata' || scope.startsWith('write:/') || scope.startsWith('read:/')) return scope as Scope
-  throw new UsageError(`Unknown scope "${scope}". Use appdata, identify, write:/<path> or read:/pups/private/<path>.`)
+  if (['identify', 'appdata', 'identity-tokens'].includes(scope) || scope.startsWith('write:/') || scope.startsWith('read:/')) return scope as Scope
+  throw new UsageError(`Unknown scope "${scope}". Use appdata, identify, identity-tokens, write:/<path> or read:/pups/private/<path>.`)
 }
 
 const out = (text: string) => process.stdout.write(text + '\n')
@@ -110,6 +112,7 @@ async function run(argv: string[]): Promise<number> {
       output: { type: 'string', short: 'o' },
       type: { type: 'string' },
       'keep-grant': { type: 'boolean' },
+      read: { type: 'boolean' },
       json: { type: 'boolean' },
       help: { type: 'boolean', short: 'h' },
       version: { type: 'boolean' },
@@ -282,6 +285,15 @@ async function run(argv: string[]): Promise<number> {
       const session = await openSession()
       await session.hostMeta.setProperty(uri, value)
       info(`Set ${uri}`)
+      return 0
+    }
+
+    case 'identity-token': {
+      requireArgs(1, 'identity-token <origin>')
+      const session = await openSession()
+      const { token, expiresAt } = await session.identityToken(args[0]!, { read: opts.read })
+      out(token)
+      info(`${opts.read ? 'A read token, valid' : 'Valid'} until ${expiresAt.toISOString()}, at ${args[0]} only, as ${session.handle}.`)
       return 0
     }
 
