@@ -7,7 +7,7 @@ The reference client for **Personal Upload Servers** (PUPS, [bigwide.net RFC-6](
 
 PUPS lets any app write files to a user's domain, knowing nothing but the domain. The user approves the app at their own server with standard OAuth, and everything the app writes is published as static files, except in the private areas that only the owner's apps can read.
 
-> Status: 0.1, implements RFC-6 `spec_version` 0.1. The RFC is a draft, so the API may still change.
+> **Experimental:** pups-client and PUPS are at an experimental stage. Expect backward-incompatible changes between versions. It implements RFC-6 `spec_version` 0.1, which is a draft.
 
 ## Command line tool
 
@@ -213,10 +213,40 @@ voteButton.onclick = async () => {
 ```
 
 - `session.fetchAsOwner(url, init)` gets a new token for the origin of `url` (`https://polls.example.com`) and sends it once, as `Authorization: Bearer <token>`. It doesn't follow redirects, so the token can't end up elsewhere; the response is returned as it is (in browsers a redirect is an opaque response with status 0).
-- `session.identityToken(audience)` returns the token itself, a JWT valid for about a minute, for an origin, e.g. for a `WebSocket` or a request you send yourself. Get a new one for every request; the server may reject one it has seen.
+- `session.identityToken(audience)` returns `{ token, expiresAt, read }`: the token itself, a JWT valid for about a minute, for an origin, e.g. for a `WebSocket` or a request you send yourself. Get a new one for every request; the server may reject one it has seen.
 - **Only when the user acts.** Get a token only when the user does something the app presented as done with their identity at that server, and show `session.handle` and the server there. Never in the background, when fetching or previewing, or because content asked for it. Take the audience from the URL you send to, never from a feed or a response.
 - **Errors**: `unsupported` (the server issues no identity tokens: check `server.identityTokens`), `insufficient_scope` (the grant lacks `identity-tokens`: log in again), `invalid_target` (not one `https` origin, or one the server refuses, e.g. an IP address), `rate_limited` (60 tokens per grant and minute; see `retryAfter`), `session_expired`. The access token is renewed first if needed.
-- On the command line: `pups login <domain> -c <client> -s identity-tokens`, then `pups identity-token https://polls.example.com` prints a token, e.g. to test a server with `curl -H "Authorization: Bearer $(pups identity-token …)"`.
+- On the command line: `pups login <domain> -c <client> -s identity-tokens`, then `pups identity-token https://polls.example.com` prints a token (`--read` a read token), e.g. to test a server with `curl -H "Authorization: Bearer $(pups identity-token …)"`.
+
+#### Personal feeds
+
+Some feeds show each reader their own version, or only let some domains in, e.g. a group's moderation queue that only its moderators can read. The reader subscribes *as the user*, and fetches the feed with a **read token**: good only for reading feeds, for up to 24 hours, kept per origin as safely as the access token and reused, so the PUPS server sees one exchange per origin and day.
+
+```ts
+import { accessLevel, identityChallenge } from 'pups-client'
+
+// 1. Find out what to offer, without sending any token: from the feed link in host-meta.json …
+const level = accessLevel(link)               // 'public' | 'restricted' | 'personal' | 'optional'
+// … or from the response to a plain fetch of a pasted URL.
+const challenge = await identityChallenge(await fetch(feedUrl))   // { identity: 'required', realm, detail }
+if (level != 'public' || challenge?.identity)
+  offer(`Subscribe as ${session.handle}`, challenge?.realm)          // the realm is the server's words
+
+// 2. Only after the user chose that: fetch with the read token.
+const response = await session.fetchFeedAsOwner(feedUrl)
+if (response.status == 403)
+  showMessage(`${session.handle} has no access. ${(await identityChallenge(response))?.detail ?? ''}`)
+else if (response.ok) subscribe(feedUrl, { as: session.handle, feed: await response.json() })
+
+// Unsubscribing, or switching to an anonymous subscription: forget the token when no other such feed is left there.
+await session.forgetReadToken(feedUrl)
+```
+
+- `session.fetchFeedAsOwner(url, { method, headers, signal })` sends `GET` or `HEAD` with the read token for the origin of `url`, getting or renewing it as needed (ten minutes before it expires, using the server's `expires_in`). After a `401` with `error="invalid_token"` it tries once more with a new one. It doesn't follow redirects, and returns the response whatever its status: `200`, `304` for `If-None-Match`, `403` when the domain has no access (a subscribed feed that starts answering `403` stays subscribed; show that access was lost).
+- `session.identityToken(origin, { read: true })` returns the read token itself; `forgetReadToken(origin)` drops it. Read tokens are never used for actions: `fetchAsOwner()` always gets a new short-lived token.
+- **No probing.** An `access` property or an `identity` challenge only leads to an offer. Fetch with a token only for feeds the user subscribed to as themselves, and send it with nothing else: not with the items' links, images or attachments.
+- `accessLevel(link)` reads the link property `https://bigwide.net/ns/access` (`ACCESS_PROPERTY`): `public` without it, `restricted` for unknown values. `session.listFeeds()` returns it as `access`. Pages for visitors leave out `restricted` and `personal` feeds.
+- `identityChallenge(response)` reads the `WWW-Authenticate` Bearer challenge (`identity`, `realm`, `error`) and the `title` and `detail` of an `application/problem+json` body, from a clone; `bearerChallenge(header)` parses the header alone. In browsers, the feed's server must list `WWW-Authenticate` in `Access-Control-Expose-Headers`.
 
 ### What the library does for you
 

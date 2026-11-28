@@ -27,10 +27,14 @@ export interface MockOptions {
   identityTokens?: boolean
   /** Identity tokens per grant and minute; more get 429 `slow_down`. Default 60. */
   identityTokensPerMinute?: number
+  /** The lifetime of read tokens in seconds (`expires_in`). Default 86400. */
+  readTokenLifetime?: number
 }
 
 /** An identity token the mock issued, with its claims. */
-export interface IssuedIdentityToken { token: string; aud: string; client_id: string; sub: string; iss: string; jti: string }
+export interface IssuedIdentityToken {
+  token: string; aud: string; client_id: string; sub: string; iss: string; jti: string; iat: number; exp: number; scope?: 'read'
+}
 
 interface Pair { refresh: string; access: string; used: boolean }
 interface Grant {
@@ -202,17 +206,22 @@ export function createMockServer(options: MockOptions = {}) {
     if (audiences.length != 1 || url?.protocol != 'https:' || url.origin != audience || !url.hostname.includes('.')
       || url.hostname == 'localhost' || /\.(local|localhost)$/.test(url.hostname) || /^[\d.]+$|^\[/.test(url.hostname))
       return json(400, { error: 'invalid_target', error_description: 'audience must be one https origin' })
-    for (const name of ['resource', 'scope', 'actor_token']) if (body.has(name)) return json(400, { error: 'invalid_request' })
+    for (const name of ['resource', 'actor_token']) if (body.has(name)) return json(400, { error: 'invalid_request' })
+    const read = body.has('scope')
+    if (read && body.get('scope') != 'read') return json(400, { error: 'invalid_scope', error_description: 'scope must be read' })
     const now = Date.now()
     grant.identityTokens = (grant.identityTokens ?? []).filter(t => now - t < 60_000)
     if (grant.identityTokens.length >= (options.identityTokensPerMinute ?? 60))
       return json(429, { error: 'slow_down', error_description: 'Too many identity tokens' }, { 'Retry-After': '60' })
     grant.identityTokens.push(now)
     const b64 = (value: unknown) => Buffer.from(JSON.stringify(value)).toString('base64url')
-    const claims = { iss: origin, sub: state.me, aud: audience, client_id: grant.clientId, iat: Math.floor(now / 1000), exp: Math.floor(now / 1000) + 60, jti: token('jti') }
+    const lifetime = read ? options.readTokenLifetime ?? 86_400 : 60
+    const iat = Math.floor(now / 1000)
+    const claims = { iss: origin, sub: state.me, aud: audience, client_id: grant.clientId, ...read ? { scope: 'read' as const } : {}, iat, exp: iat + lifetime, jti: token('jti') }
     const jwt = `${b64({ typ: 'at+jwt', alg: 'RS256', kid: 'mock' })}.${b64(claims)}.fake-signature`
     state.identityTokens.push({ token: jwt, ...claims })
-    return json(200, { access_token: jwt, issued_token_type: 'urn:ietf:params:oauth:token-type:jwt', token_type: 'Bearer', expires_in: 60 }, { 'Cache-Control': 'no-store' })
+    return json(200, { access_token: jwt, issued_token_type: 'urn:ietf:params:oauth:token-type:jwt', token_type: 'Bearer', expires_in: lifetime,
+      ...read ? { scope: 'read' } : {} }, { 'Cache-Control': 'no-store' })
   }
 
   /** A request to another origin; follows redirects unless `redirect` is `'manual'`, keeping all headers. */

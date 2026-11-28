@@ -291,13 +291,21 @@ interface PupsSession {
 
   readonly hostMeta: HostMetaEditor
 
-  identityToken(audience: string, options?: { signal?: AbortSignal }): Promise<string>   // RFC-10, a JWT for one origin
-  fetchAsOwner(url: string | URL, init?: RequestInit): Promise<Response>               // one request with a new identity token
+  identityToken(audience: string, options?: { signal?: AbortSignal; read?: boolean }): Promise<IdentityToken>   // RFC-10
+  fetchAsOwner(url: string | URL, init?: RequestInit): Promise<Response>    // one action with a new identity token
+  fetchFeedAsOwner(url: string | URL, init?: { method?: 'GET' | 'HEAD'; headers?: HeadersInit; signal?: AbortSignal }): Promise<Response>
+  forgetReadToken(url: string | URL): Promise<void>                         // the read token of the URL's origin
 
   logout(options?: { revoke?: boolean }): Promise<{ revoked: boolean }>
 }
 
 type Body = string | Blob | ArrayBuffer | ArrayBufferView | JsonValue
+
+interface IdentityToken {
+  token: string                    // the JWT
+  expiresAt: Date                  // from the server's expires_in
+  read: boolean                    // a read token: only for fetching feeds, reused for up to 24 hours
+}
 
 interface WriteOptions {
   contentType?: string             // default: the served type of the extension
@@ -352,6 +360,11 @@ RFC-10 lets an app act as the owner's domain on other servers: vote in a poll, m
 - **Before sending**, the library checks what it can: `server.identityTokens` (`unsupported`), the granted scope (`insufficient_scope`) and that the audience is exactly one `https` origin, without path or `/` (`invalid_target`). The server also refuses IP addresses, `localhost` and `.local` names.
 - **Server errors** map to codes: `invalid_scope` → `insufficient_scope`, `invalid_target` → `invalid_target`, `429` `slow_down` → `rate_limited` with `retryAfter` (60 tokens per grant and minute), `unsupported_grant_type` → `unsupported`, `invalid_grant` twice → `invalid_token`, a failed renewal → `session_expired`.
 - **The rules of RFC-10 for apps** are in the TSDoc: get a token only for an action the user took, presented as done with their identity at that server; show `session.handle` there; one token per request.
+- **Read tokens** (`identityToken(origin, { read: true })`) add `scope=read` to the exchange. The server answers with `"scope": "read"` and the lifetime it chose in `expires_in` (24 hours at most); an answer without `scope` means the server doesn't issue read tokens (`unsupported`). The library keeps one read token per origin in the session record, `readTokens: { [origin]: { token, expiresAt, renewAt } }`, so it is stored like the access token (encrypted in IndexedDB, mode 0600 in the CLI's file), written under the refresh lock after rereading the record, shared by all tabs and deleted with the session at logout. It is handed out again until `renewAt`, ten minutes before it expires (at most half its lifetime before), then renewed. `forgetReadToken(origin)` deletes it.
+- **`fetchFeedAsOwner(url)`** sends `GET` or `HEAD` with the read token of the origin of `url`, the caller's headers (e.g. `If-None-Match`) and `redirect: 'manual'`. After a `401` whose Bearer challenge has `error="invalid_token"`, it gets a new read token and tries exactly once more. It returns the response whatever its status, so the app can tell `200` from `403` (no access) and `304`. Any other method is refused with `invalid_request`: a read token never goes with an action, and `fetchAsOwner()` never uses a read token.
+- **What to offer.** Two helpers inform the offer *Subscribe as @tim.example.com* and never fetch anything with a token themselves:
+  - `accessLevel(link)` reads the `host-meta.json` link property `https://bigwide.net/ns/access` (`ACCESS_PROPERTY`): absent, `null` or `public` → `public`; `restricted`, `personal`, `optional` as they are; anything else → `restricted`. `listFeeds()` returns it as `FeedLink.access`.
+  - `identityChallenge(response)` returns `{ identity?, realm?, error?, title?, detail? }` from the first Bearer challenge of `WWW-Authenticate` (`identity` only if `required` or `optional`) and an `application/problem+json` body, read from a clone; undefined if the response has neither. `bearerChallenge(header)` is the RFC 9110 parser behind it: several challenges, quoted strings with escapes, token68 skipped, names lowercased. Cross-origin, browsers expose `WWW-Authenticate` only if the server lists it in `Access-Control-Expose-Headers`.
 
 ```ts
 // A poll in a feed: "Vote as @tim.example.com at polls.example.com"
@@ -656,6 +669,7 @@ interface SessionRecord {
   refreshToken?: string
   createdAt: number
   lastUsedAt: number
+  readTokens?: Record<string, { token: string; expiresAt: number; renewAt: number }>   // RFC-10 read tokens by origin
 }
 ```
 
@@ -759,6 +773,19 @@ voteButton.onclick = () => session.fetchAsOwner('https://polls.example.com/polls
 })
 ```
 
+### Subscribing to a personal feed (RFC-10)
+
+```ts
+const link = (await fetchHostMeta(site)).links.find(l => l.rel == FEED_REL)      // or a pasted feed URL
+const challenge = await identityChallenge(await fetch(link.href))               // no token: nothing is revealed
+if (accessLevel(link) == 'public' && !challenge?.identity) return subscribeAnonymously(link.href)
+if (!await confirm(`Subscribe as ${session.handle}? ${challenge?.realm ?? link.titles?.default ?? link.href}`)) return
+const response = await session.fetchFeedAsOwner(link.href)                      // the read token of the feed's origin
+if (response.status == 403) return showMessage(`${session.handle} has no access. ${(await identityChallenge(response))?.detail ?? ''}`)
+subscribe(link.href, { as: session.handle })                                    // later polls: fetchFeedAsOwner() again
+// unsubscribe: session.forgetReadToken(link.href), once no other feed there is read as the user
+```
+
 ### A blog feed (RFC-7)
 
 ```ts
@@ -785,7 +812,7 @@ The package also contains `pups`, a command line tool built on the same core. It
 
 - **Client identity.** The user names a client domain they control, e.g. `tim.example.app`. The `client_id` is `https://<client-domain>/pups-cli.json` (or any URL given in full). `pups client-metadata <client-domain>` prints the document to publish there, listing `http://127.0.0.1/callback` and `http://[::1]/callback`; `pups check-client` verifies it, and `pups login` runs the same check first, because otherwise the server would show an error page and the CLI would wait in vain.
 - **Login.** `pups login <domain> -c <client-domain>` listens on a random port of `127.0.0.1`, builds the authorization URL with `createAuthorization()` and redirect URI `http://127.0.0.1:<port>/callback`, opens the system browser (or prints the URL with `--no-browser`), receives the redirect, and finishes with `completeAuthorization()`. RFC-6 ignores the port of loopback redirects, so one entry in the client metadata document covers every port. The callback page has no scripts or external resources and sends `Referrer-Policy: no-referrer`.
-- **Commands.** `whoami`, `put` (several files, `--to` file or directory, `-` for stdin, `--create`, `--if-match`, `--content-type`), `get`, `rm`, `url`, `link add|remove`, `property set`, `identity-token <origin>` (RFC-10), `logout [--keep-grant]`, `sessions`. `--json` gives machine-readable output. Exit codes: 0 success, 1 error, 2 usage.
+- **Commands.** `whoami`, `put` (several files, `--to` file or directory, `-` for stdin, `--create`, `--if-match`, `--content-type`), `get`, `rm`, `url`, `link add|remove`, `property set`, `identity-token <origin> [--read]` (RFC-10), `logout [--keep-grant]`, `sessions`. `--json` gives machine-readable output. Exit codes: 0 success, 1 error, 2 usage.
 - **Credentials** are kept by `FileTokenStore` in `~/.config/pups/sessions.json` (or `$XDG_CONFIG_HOME/pups`, `$PUPS_CONFIG_DIR`), mode 0600 in a 0700 directory, written atomically through a temporary file. That is how tools like `gh` keep credentials; an OS keychain would need native dependencies.
 - **Known limit.** Web Locks only coordinate within one process. Two `pups` processes refreshing the same session at once would make the server revoke the grant, so the documentation says not to run them in parallel, and `put` takes many files at once. A lock file would close this gap later.
 
